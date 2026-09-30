@@ -88,7 +88,7 @@ erDiagram
   that change across a thread stay clean and are searchable.
 - **attachments**: metadata tied to the message it arrived on. `blob_key` is
   a reference into the file store; no bytes in the database.
-- **sync_state**: the bookmark. The next run asks IMAP for
+- **sync_state**: the bookmark, one row per folder (`IMAP_FOLDERS`). The next run asks IMAP for
   `UID last_seen_uid+1:*`. A changed `uid_validity` triggers a re-walk, and
   de-dup makes that safe.
 - **decision_log**: the audit trail, one row per message, rewritten each time
@@ -105,7 +105,7 @@ The bookmark is read first and moved last.
 | 3 | **Already judged?** If `decision_log` has the Message-ID, skip. A rescan never re-judges. | `decision_log`, `emails` | |
 | 4 | **Find the thread.** A reply into a thread with `has_payment` is kept regardless of its own content. | `threads`, `emails` | |
 | 5 | **Classify** tiers 1 to 3 | | `decision_log` |
-| 6 | **Keep?** Payment document, or payment thread, or `STORE_ONLY_PAYMENT=false` → save. Otherwise drop: only the log line is written. | | |
+| 6 | **Keep?** Payment document, or payment thread, or `STORE_ONLY_PAYMENT=false` (the default) → save. Otherwise drop: only the log line is written. | | |
 | 7 | **Save in one transaction**: thread (found or created), email, participants, attachments. Files were written to the store just before. When a thread turns into a payment thread, its earlier mail that was dropped is backfilled from the mailbox by Message-ID. | | `threads`, `emails`, `email_participants`, `attachments`, files |
 | 8 | Move the bookmark | | `sync_state` |
 

@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Protocol
 
 from sqlalchemy.exc import IntegrityError
@@ -56,12 +56,23 @@ class MailSource(Protocol):
     def find_uid_by_message_id(self, message_id: str) -> int | None: ...
 
 
-ClientFactory = Callable[[Settings], MailSource]
+ClientFactory = Callable[[Settings, str], MailSource]
+
+
+@dataclass
+class FolderResult:
+    folder: str
+    status: str = STATUS_OK
+    candidates: int = 0
+    last_seen_uid: int = 0
+    full_rewalk: bool = False
+    error: str | None = None
 
 
 @dataclass
 class SyncResult:
     status: str
+    folders: list[FolderResult] = field(default_factory=list)
     candidates: int = 0
     kept: int = 0
     payment_hits: int = 0
@@ -70,8 +81,6 @@ class SyncResult:
     backfilled: int = 0
     failed: int = 0
     error: str | None = None
-    last_seen_uid: int = 0
-    full_rewalk: bool = False
     duration_seconds: float = 0.0
 
     @property
@@ -94,52 +103,75 @@ def run_sync(
     client_factory: ClientFactory = MailClient,
     store: FileSystemStore | None = None,
 ) -> SyncResult:
+    """Sync every folder in ``settings.imap_folders``, each with its own
+    bookmark. Messages from all folders land in the same threads."""
     started = time.monotonic()
-    folder = settings.imap_folder
     result = SyncResult(status=STATUS_OK)
     store = store or build_store(settings)
 
-    with session_factory() as session:
-        state = repo.get_sync_state(session, folder)
-
-    uid_validity = state.uid_validity if state else None
-    result.last_seen_uid = state.last_seen_uid if state else 0
-
-    try:
-        with client_factory(settings) as client:
-            uid_validity = client.uidvalidity
-            after_uid, result.full_rewalk = _resume_point(state, client.uidvalidity)
-            if result.full_rewalk:
-                result.last_seen_uid = 0
-
-            uids = client.search_uids(after_uid)
-            if after_uid is None:
-                uids = uids[-settings.initial_fetch_limit :]
-            result.candidates = len(uids)
-            logger.info(
-                "sync %s: %d candidate(s), resuming after UID %s%s",
-                folder, len(uids), after_uid, " (full re-walk)" if result.full_rewalk else "",
-            )
-
-            processor = _Processor(client, session_factory, store, settings.store_only_payment, result)
-            for uid in uids:  # ascending, so last_seen_uid only ever moves forward
-                processor.process(uid)
-                result.last_seen_uid = max(result.last_seen_uid, uid)
-
-    except MailConnectionLost as exc:
-        result.status, result.error = STATUS_PARTIAL, str(exc)
-        logger.warning("sync interrupted: %s", exc)
-    except (MailClientError, AttachmentStoreError) as exc:
-        result.status, result.error = STATUS_FAILED, str(exc)
-        logger.error("sync failed: %s", exc)
-
-    # The bookmark is read first and moved last.
-    with session_factory() as session, session.begin():
-        repo.save_sync_state(session, folder, uid_validity=uid_validity, last_seen_uid=result.last_seen_uid)
+    for folder in settings.imap_folders:
+        folder_result = _sync_folder(settings, folder, session_factory, client_factory, store, result)
+        result.folders.append(folder_result)
+        if folder_result.status == STATUS_FAILED:
+            result.status = STATUS_FAILED
+            result.error = f"{folder}: {folder_result.error}"
+            break  # a login or connection failure will repeat for the next folder
+        if folder_result.status == STATUS_PARTIAL and result.status == STATUS_OK:
+            result.status, result.error = STATUS_PARTIAL, f"{folder}: {folder_result.error}"
 
     result.duration_seconds = round(time.monotonic() - started, 2)
     logger.info("sync finished: %s in %.1fs", result.summary(), result.duration_seconds)
     return result
+
+
+def _sync_folder(
+    settings: Settings,
+    folder: str,
+    session_factory: sessionmaker[Session],
+    client_factory: ClientFactory,
+    store: FileSystemStore,
+    totals: SyncResult,
+) -> FolderResult:
+    fr = FolderResult(folder=folder)
+    with session_factory() as session:
+        state = repo.get_sync_state(session, folder)
+
+    uid_validity = state.uid_validity if state else None
+    fr.last_seen_uid = state.last_seen_uid if state else 0
+
+    try:
+        with client_factory(settings, folder) as client:
+            uid_validity = client.uidvalidity
+            after_uid, fr.full_rewalk = _resume_point(state, client.uidvalidity)
+            if fr.full_rewalk:
+                fr.last_seen_uid = 0
+
+            uids = client.search_uids(after_uid)
+            if after_uid is None:
+                uids = uids[-settings.initial_fetch_limit :]
+            fr.candidates = len(uids)
+            totals.candidates += len(uids)
+            logger.info(
+                "sync %s: %d candidate(s), resuming after UID %s%s",
+                folder, len(uids), after_uid, " (full re-walk)" if fr.full_rewalk else "",
+            )
+
+            processor = _Processor(client, session_factory, store, settings.store_only_payment, totals)
+            for uid in uids:  # ascending, so last_seen_uid only ever moves forward
+                processor.process(uid)
+                fr.last_seen_uid = max(fr.last_seen_uid, uid)
+
+    except MailConnectionLost as exc:
+        fr.status, fr.error = STATUS_PARTIAL, str(exc)
+        logger.warning("sync %s interrupted: %s", folder, exc)
+    except (MailClientError, AttachmentStoreError) as exc:
+        fr.status, fr.error = STATUS_FAILED, str(exc)
+        logger.error("sync %s failed: %s", folder, exc)
+
+    # The bookmark is read first and moved last.
+    with session_factory() as session, session.begin():
+        repo.save_sync_state(session, folder, uid_validity=uid_validity, last_seen_uid=fr.last_seen_uid)
+    return fr
 
 
 def _resume_point(state: repo.SyncStateInfo | None, server_uidvalidity: int | None) -> tuple[int | None, bool]:

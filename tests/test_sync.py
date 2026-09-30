@@ -18,7 +18,7 @@ from mailbox_viewer.config import Settings
 from mailbox_viewer.db import init_db, make_engine, make_session_factory
 from mailbox_viewer.mail_client import MailClientError, MailConnectionLost
 from mailbox_viewer.models import Attachment, DecisionLog, Email, EmailParticipant, Thread
-from mailbox_viewer.sync import STATUS_OK, STATUS_PARTIAL, run_sync
+from mailbox_viewer.sync import STATUS_FAILED, STATUS_OK, STATUS_PARTIAL, run_sync
 
 from .fakes import FakeMailClient, FakeMailServer, build_message
 
@@ -46,6 +46,7 @@ class SyncTests(unittest.TestCase):
         init_db(self.engine)
         self.factory = make_session_factory(self.engine)
         self.server = FakeMailServer()
+        self.servers: dict[str, FakeMailServer] = {}  # extra folders for multi-folder tests
         self.store = FileSystemStore(self.att_dir)
 
     def tearDown(self) -> None:
@@ -71,7 +72,7 @@ class SyncTests(unittest.TestCase):
 
     def sync(self, **overrides):
         settings = dataclasses.replace(self.settings, **overrides)
-        return run_sync(settings, self.factory, lambda _s: FakeMailClient(self.server), store=self.store)
+        return run_sync(settings, self.factory, lambda _s, folder: FakeMailClient(self.servers.get(folder, self.server), folder), store=self.store)
 
     def counts(self) -> tuple[int, int, int, int]:
         with self.factory() as session:
@@ -122,7 +123,7 @@ class SyncTests(unittest.TestCase):
 
         result = self.sync()
 
-        self.assertTrue(result.full_rewalk)
+        self.assertTrue(result.folders[0].full_rewalk)
         self.assertEqual((result.kept, result.skipped), (0, 3))
         self.assertEqual(self.counts(), (3, 3, 1, 1))
         self.assertEqual((self.state().uid_validity, self.state().last_seen_uid), (2, 13))
@@ -290,6 +291,41 @@ class SyncTests(unittest.TestCase):
         self.assertEqual((second.status, second.candidates, second.kept), (STATUS_OK, 2, 2))
         self.assertEqual(self.counts()[1], 3)
 
+    def test_inbox_and_sent_folders_complete_a_thread(self) -> None:
+        self.server.add(1, build_message(subject="Invoice #7", sender="Ravi <ravi@example.com>", message_id="<root@x>", date="Mon, 01 Sep 2026 09:00:00 +0000"))
+        sent = FakeMailServer(uidvalidity=7)
+        sent.add(1, build_message(subject="Re: Invoice #7", sender="Me <me@example.com>", to="ravi@example.com", message_id="<mine@x>", in_reply_to="<root@x>", references="<root@x>", date="Mon, 01 Sep 2026 10:00:00 +0000"))
+        self.server.add(2, build_message(subject="Re: Re: Invoice #7", sender="Ravi <ravi@example.com>", message_id="<r2@x>", in_reply_to="<mine@x>", references="<root@x> <mine@x>", date="Mon, 01 Sep 2026 11:00:00 +0000"))
+        self.servers["[Gmail]/Sent Mail"] = sent
+
+        result = self.sync(imap_folders=("INBOX", "[Gmail]/Sent Mail"))
+
+        self.assertEqual((result.status, result.kept), (STATUS_OK, 3))
+        self.assertEqual([fr.folder for fr in result.folders], ["INBOX", "[Gmail]/Sent Mail"])
+        self.assertEqual([fr.last_seen_uid for fr in result.folders], [2, 1])
+        with self.factory() as session:
+            threads = repo.list_threads(session)
+            self.assertEqual(len(threads), 1)
+            self.assertEqual((threads[0].message_count, threads[0].participants), (3, "Ravi, Me"))
+            self.assertEqual(repo.get_sync_state(session, "[Gmail]/Sent Mail").uid_validity, 7)
+            self.assertEqual(repo.get_sync_state(session, "INBOX").last_seen_uid, 2)
+
+        again = self.sync(imap_folders=("INBOX", "[Gmail]/Sent Mail"))
+        self.assertEqual((again.candidates, again.kept), (0, 0))
+
+    def test_failed_folder_stops_the_run_with_failed_status(self) -> None:
+        self.seed_three_messages()
+
+        def factory(_s, folder):
+            if folder == "BROKEN":
+                raise MailClientError("no such folder")
+            return FakeMailClient(self.server, folder)
+
+        result = run_sync(dataclasses.replace(self.settings, imap_folders=("INBOX", "BROKEN")), self.factory, factory, store=self.store)
+        self.assertEqual(result.status, STATUS_FAILED)
+        self.assertIn("BROKEN", result.error)
+        self.assertEqual(result.kept, 3)
+
     def test_list_threads_filters(self) -> None:
         self.seed_three_messages()
         self.sync()
@@ -341,7 +377,7 @@ class KeepOnlyPaymentFlowTests(SyncTests):
 
         result = self.sync()
 
-        self.assertTrue(result.full_rewalk)
+        self.assertTrue(result.folders[0].full_rewalk)
         self.assertEqual((result.kept, result.skipped), (0, 3))
         self.assertEqual(self.counts(), (1, 1, 1, 1))
 
@@ -415,6 +451,12 @@ class KeepOnlyPaymentFlowTests(SyncTests):
         self.sync()
         with self.factory() as session:
             self.assertEqual([t.subject for t in repo.list_threads(session)], ["Your account statement"])
+
+    def test_inbox_and_sent_folders_complete_a_thread(self) -> None:
+        self.skipTest("multi-folder threading is exercised under keep-everything")
+
+    def test_failed_folder_stops_the_run_with_failed_status(self) -> None:
+        self.skipTest("exercised under keep-everything")
 
     # -- the flow itself -----------------------------------------------------------------
 

@@ -34,7 +34,13 @@ class Settings:
     db_schema: str | None = None  # PostgreSQL schema for the tables; None = server default (public)
     # True: keep only payment documents and mail in payment threads; other mail
     # leaves just a decision_log line. False: keep every message.
-    store_only_payment: bool = True
+    store_only_payment: bool = False
+    # Every folder to sync, each with its own bookmark. Defaults to (imap_folder,).
+    imap_folders: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.imap_folders:
+            object.__setattr__(self, "imap_folders", (self.imap_folder,))
 
 
 _REQUIRED = ("IMAP_HOST", "IMAP_USER", "IMAP_PASSWORD")
@@ -46,7 +52,7 @@ _DEFAULTS = {
     "DATABASE_URL": "sqlite:///data/mailbox_cache.db",
     "INITIAL_FETCH_LIMIT": "200",
     "ATTACHMENT_DIR": "data/attachments",
-    "STORE_ONLY_PAYMENT": "true",
+    "STORE_ONLY_PAYMENT": "false",
 }
 
 
@@ -66,6 +72,10 @@ def load_settings(env_file: str | os.PathLike[str] | None = None) -> Settings:
             + ". Copy .env.example to .env and fill them in."
         )
 
+    # IMAP_FOLDERS is a comma-separated list, e.g. "INBOX,[Gmail]/Sent Mail".
+    # When absent, only IMAP_FOLDER is synced.
+    folders = tuple(f.strip() for f in _get("IMAP_FOLDERS").split(",") if f.strip()) or (_get("IMAP_FOLDER"),)
+
     db_schema = _get("DB_SCHEMA") or None
     if db_schema and not _IDENTIFIER_RE.match(db_schema):
         raise ConfigError(f"DB_SCHEMA must be a plain identifier (letters, digits, underscore), got {db_schema!r}")
@@ -75,13 +85,14 @@ def load_settings(env_file: str | os.PathLike[str] | None = None) -> Settings:
         imap_port=_get_int("IMAP_PORT"),
         imap_user=_get("IMAP_USER"),
         imap_password=_get("IMAP_PASSWORD"),
-        imap_folder=_get("IMAP_FOLDER"),
+        imap_folder=folders[0],
         imap_timeout=_get_int("IMAP_TIMEOUT"),
         database_url=_get("DATABASE_URL"),
         initial_fetch_limit=_get_int("INITIAL_FETCH_LIMIT"),
         attachment_dir=_get("ATTACHMENT_DIR") or "data/attachments",
         db_schema=db_schema,
         store_only_payment=_get_bool("STORE_ONLY_PAYMENT"),
+        imap_folders=folders,
     )
 
 

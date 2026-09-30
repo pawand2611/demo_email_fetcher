@@ -41,6 +41,7 @@ def main(argv: list[str] | None = None) -> int:
 
     store = build_store(settings)
     print(f"Attachments  : {store.describe()}")
+    print(f"Folders      : {', '.join(settings.imap_folders)}")
     print(f"Keep policy  : {'payment documents and payment threads only' if settings.store_only_payment else 'every message'}")
 
     engine = make_engine(settings.database_url, settings.db_schema)
@@ -60,8 +61,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.reset_state:
         with session_factory() as session, session.begin():
-            removed = repo.delete_sync_state(session, settings.imap_folder)
-        print("Sync state cleared" if removed else "No sync state to clear")
+            removed = [f for f in settings.imap_folders if repo.delete_sync_state(session, f)]
+        print("Sync state cleared for: " + ", ".join(removed) if removed else "No sync state to clear")
 
     before = _counts(session_factory)
     result = run_sync(settings, session_factory, store=store)
@@ -69,13 +70,16 @@ def main(argv: list[str] | None = None) -> int:
 
     print()
     print(f"Status        : {result.status}" + (f" ({result.error})" if result.error else ""))
-    print(f"Candidates    : {result.candidates}" + ("  [full re-walk]" if result.full_rewalk else ""))
+    print(f"Candidates    : {result.candidates}")
     print(f"Kept          : {result.kept}  ({result.payment_hits} payment documents, {result.backfilled} backfilled)")
     print(f"Dropped       : {result.dropped}  (judged, not stored)")
     print(f"Skipped       : {result.skipped}  (already judged)")
     print(f"Failed        : {result.failed}")
-    print(f"Last seen UID : {result.last_seen_uid}")
     print(f"Duration      : {result.duration_seconds}s")
+    for fr in result.folders:
+        note = "  [full re-walk]" if fr.full_rewalk else ""
+        err = f"  ({fr.status}: {fr.error})" if fr.error else ""
+        print(f"  folder {fr.folder!r}: {fr.candidates} candidate(s), last seen UID {fr.last_seen_uid}{note}{err}")
     print()
     print(f"{'table':<20}{'before':>8}{'after':>8}")
     for name in before:

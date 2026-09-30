@@ -53,9 +53,15 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(ConfigError):
             load(DB_SCHEMA="poc; drop table x")
 
+    def test_imap_folders(self) -> None:
+        self.assertEqual(load().imap_folders, ("INBOX",))
+        s = load(IMAP_FOLDERS="INBOX, [Gmail]/Sent Mail")
+        self.assertEqual(s.imap_folders, ("INBOX", "[Gmail]/Sent Mail"))
+        self.assertEqual(s.imap_folder, "INBOX")
+
     def test_store_only_payment_flag(self) -> None:
-        self.assertTrue(load().store_only_payment)
-        self.assertFalse(load(STORE_ONLY_PAYMENT="false").store_only_payment)
+        self.assertFalse(load().store_only_payment)
+        self.assertTrue(load(STORE_ONLY_PAYMENT="true").store_only_payment)
         with self.assertRaises(ConfigError):
             load(STORE_ONLY_PAYMENT="maybe")
 

@@ -81,14 +81,18 @@ python sync_mail.py --reclassify       # re-run payment-document rules over the 
 python -m unittest -v                  # unit tests, no mailbox needed
 ```
 
-## What gets stored
+## Folders and what gets stored
 
-By default (`STORE_ONLY_PAYMENT=true`) every fetched message is judged and
-logged in `decision_log`, but only payment documents (statements, invoices,
-receipts) and the threads they belong to are stored. When a thread turns into
-a payment thread, its earlier messages are backfilled from the mailbox. Set
-`STORE_ONLY_PAYMENT=false` to keep every message. The sidebar shows how many
-messages were judged versus stored.
+`IMAP_FOLDERS` lists the folders to sync, each with its own bookmark; the
+default `INBOX,[Gmail]/Sent Mail` makes threads complete with your own
+replies, and messages from all folders land in the same threads.
+
+By default (`STORE_ONLY_PAYMENT=false`) every fetched message is stored.
+With `STORE_ONLY_PAYMENT=true` every message is still judged and logged in
+`decision_log`, but only payment documents (statements, invoices, receipts)
+and the threads they belong to are stored; when a thread turns into a payment
+thread, its earlier messages are backfilled from the mailbox. The sidebar
+shows how many messages were judged versus stored.
 
 ## How the sync stays idempotent and incremental
 

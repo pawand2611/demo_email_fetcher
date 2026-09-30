@@ -51,11 +51,12 @@ def main() -> int:
             print(f"Threads      : {repo.count_threads(session)}")
             print(f"Emails       : {repo.count_emails(session)}")
             print(f"Attachments  : {repo.count_attachments(session)}")
-            state = repo.get_sync_state(session, settings.imap_folder)
-        if state and state.last_sync_at:
-            print(f"Last sync    : {state.last_sync_at:%Y-%m-%d %H:%M} UTC, last seen UID {state.last_seen_uid}")
-        else:
-            print("Last sync    : never (run `python sync_mail.py` to fill the cache)")
+            states = {f: repo.get_sync_state(session, f) for f in settings.imap_folders}
+        for folder, state in states.items():
+            if state and state.last_sync_at:
+                print(f"Last sync    : {folder!r} {state.last_sync_at:%Y-%m-%d %H:%M} UTC, last seen UID {state.last_seen_uid}")
+            else:
+                print(f"Last sync    : {folder!r} never (run `python sync_mail.py` to fill the cache)")
     except SQLAlchemyError as exc:
         print(f"Database error: {_short(str(exc.__cause__ or exc))}", file=sys.stderr)
         return 1

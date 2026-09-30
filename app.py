@@ -84,7 +84,7 @@ def main() -> None:
 def render_sidebar(settings: Settings, factory, store: FileSystemStore) -> tuple[bool, str]:
     with st.sidebar:
         st.header("Mailbox")
-        st.caption(f"{settings.imap_user} · {settings.imap_folder}")
+        st.caption(f"{settings.imap_user} · " + ", ".join(settings.imap_folders))
         st.caption(f"Attachments → {store.describe()}")
         st.caption("Keeping: " + ("payment documents and their threads" if settings.store_only_payment else "every message"))
 
@@ -104,7 +104,7 @@ def render_sidebar(settings: Settings, factory, store: FileSystemStore) -> tuple
             st.info(f"Rules re-applied: {changed} email(s) changed.")
 
         with factory() as session:
-            state = repo.get_sync_state(session, settings.imap_folder)
+            states = {f: repo.get_sync_state(session, f) for f in settings.imap_folders}
             n_threads = repo.count_threads(session)
             n_emails = repo.count_emails(session)
             n_files = repo.count_attachments(session)
@@ -122,10 +122,11 @@ def render_sidebar(settings: Settings, factory, store: FileSystemStore) -> tuple
         st.caption(f"Judged: {n_judged} message(s) in decision_log, {n_judged - n_emails} dropped")
         if by_doc:
             st.caption("Documents: " + ", ".join(f"{k} {v}" for k, v in sorted(by_doc.items())))
-        if state is not None and state.last_sync_at is not None:
-            st.caption(f"Last sync {_fmt_local(state.last_sync_at)} · resume after UID {state.last_seen_uid}")
-        else:
-            st.caption("Never synced.")
+        for folder, state in states.items():
+            if state is not None and state.last_sync_at is not None:
+                st.caption(f"{folder}: last sync {_fmt_local(state.last_sync_at)} · resume after UID {state.last_seen_uid}")
+            else:
+                st.caption(f"{folder}: never synced.")
 
         st.divider()
         st.subheader("Filter")

@@ -38,8 +38,9 @@ class MailClient:
     or otherwise mutate the mailbox.
     """
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, folder: str | None = None) -> None:
         self._settings = settings
+        self.folder = folder or settings.imap_folder
         self._conn: imaplib.IMAP4_SSL | None = None
         self.uidvalidity: int | None = None
         self.message_count: int = 0
@@ -65,7 +66,7 @@ class MailClient:
                 settings.imap_host, settings.imap_port, timeout=settings.imap_timeout
             )
             conn.login(settings.imap_user, settings.imap_password)
-            status, data = conn.select(_quote_mailbox(settings.imap_folder), readonly=True)
+            status, data = conn.select(_quote_mailbox(self.folder), readonly=True)
         except imaplib.IMAP4.error as exc:
             raise MailClientError(f"IMAP error during connect/login: {exc}") from exc
         except OSError as exc:  # DNS, socket, TLS failures
@@ -75,7 +76,7 @@ class MailClient:
 
         if status != "OK":
             raise MailClientError(
-                f"Could not select folder {settings.imap_folder!r}: {_first(data)}"
+                f"Could not select folder {self.folder!r}: {_first(data)}"
             )
 
         self._conn = conn

@@ -57,8 +57,9 @@ class FakeMailServer:
 class FakeMailClient:
     """Drop-in for :class:`mailbox_viewer.mail_client.MailClient`."""
 
-    def __init__(self, server: FakeMailServer) -> None:
+    def __init__(self, server: FakeMailServer, folder: str = "INBOX") -> None:
         self._server = server
+        self.folder = folder
         self.uidvalidity = server.uidvalidity
         self.message_count = len(server.messages)
 
