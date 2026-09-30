@@ -1,0 +1,16 @@
+# secrets and local state
+.env
+data/
+*.db
+*.db-journal
+*.sqlite
+
+# python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# editors
+.vscode/
+.idea/
