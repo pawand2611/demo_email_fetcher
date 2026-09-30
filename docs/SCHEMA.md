@@ -94,6 +94,24 @@ erDiagram
 - **decision_log**: the audit trail, one row per message, rewritten each time
   the rules run.
 
+## How data moves on one refresh
+
+The bookmark is read first and moved last.
+
+| Step | Action | Reads | Writes |
+|---|---|---|---|
+| 1 | Refresh clicked | `sync_state` | |
+| 2 | Fetch UIDs above `last_seen_uid` over IMAP | | |
+| 3 | **Already judged?** If `decision_log` has the Message-ID, skip. A rescan never re-judges. | `decision_log`, `emails` | |
+| 4 | **Find the thread.** A reply into a thread with `has_payment` is kept regardless of its own content. | `threads`, `emails` | |
+| 5 | **Classify** tiers 1 to 3 | | `decision_log` |
+| 6 | **Keep?** Payment document, or payment thread, or `STORE_ONLY_PAYMENT=false` → save. Otherwise drop: only the log line is written. | | |
+| 7 | **Save in one transaction**: thread (found or created), email, participants, attachments. Files were written to the store just before. When a thread turns into a payment thread, its earlier mail that was dropped is backfilled from the mailbox by Message-ID. | | `threads`, `emails`, `email_participants`, `attachments`, files |
+| 8 | Move the bookmark | | `sync_state` |
+
+Streamlit reads `threads`, `emails`, `email_participants`, `attachments` and
+`decision_log`. Never the mailbox.
+
 ## Classification
 
 `mailbox_viewer/classifier.py` produces one decision per message:

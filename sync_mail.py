@@ -41,6 +41,7 @@ def main(argv: list[str] | None = None) -> int:
 
     store = build_store(settings)
     print(f"Attachments  : {store.describe()}")
+    print(f"Keep policy  : {'payment documents and payment threads only' if settings.store_only_payment else 'every message'}")
 
     engine = make_engine(settings.database_url, settings.db_schema)
     init_db(engine, settings.db_schema)
@@ -69,8 +70,9 @@ def main(argv: list[str] | None = None) -> int:
     print()
     print(f"Status        : {result.status}" + (f" ({result.error})" if result.error else ""))
     print(f"Candidates    : {result.candidates}" + ("  [full re-walk]" if result.full_rewalk else ""))
-    print(f"New           : {result.new}  ({result.payment_hits} payment documents)")
-    print(f"Skipped       : {result.skipped}  (already cached)")
+    print(f"Kept          : {result.kept}  ({result.payment_hits} payment documents, {result.backfilled} backfilled)")
+    print(f"Dropped       : {result.dropped}  (judged, not stored)")
+    print(f"Skipped       : {result.skipped}  (already judged)")
     print(f"Failed        : {result.failed}")
     print(f"Last seen UID : {result.last_seen_uid}")
     print(f"Duration      : {result.duration_seconds}s")
@@ -96,6 +98,7 @@ def _counts(session_factory) -> dict[str, int]:
             "emails": repo.count_emails(session),
             "attachments": repo.count_attachments(session),
             "payment threads": repo.count_payment_threads(session),
+            "decision_log": repo.count_decisions(session),
         }
 
 

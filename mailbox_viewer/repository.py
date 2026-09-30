@@ -129,6 +129,34 @@ def find_email_id(session: Session, message_id: str) -> int | None:
     return session.scalar(select(Email.id).where(Email.message_id == message_id))
 
 
+def is_judged(session: Session, message_id: str) -> bool:
+    """True once a decision has been logged for this message, kept or dropped."""
+    return session.get(DecisionLog, message_id) is not None
+
+
+def find_thread_id(session: Session, mail: ParsedEmail) -> int | None:
+    """The stored thread this mail would join, by conversation key or ancestor, or None."""
+    key = conversation_key(mail)
+    thread_id = session.scalar(select(Thread.id).where(Thread.conversation_key == key))
+    if thread_id is not None:
+        return thread_id
+    for ancestor in reversed(ancestor_ids(mail)):
+        thread_id = session.scalar(select(Email.thread_id).where(Email.message_id == ancestor))
+        if thread_id is not None:
+            return thread_id
+    return None
+
+
+def thread_has_payment(session: Session, thread_id: int) -> bool:
+    return bool(session.scalar(select(Thread.has_payment).where(Thread.id == thread_id)))
+
+
+def log_decision(session: Session, message_id: str, decision: Decision) -> None:
+    """Write the audit line for a message that is not being stored."""
+    _log_decision(session, message_id, decision)
+    session.flush()
+
+
 def insert_email(session: Session, mail: ParsedEmail, decision: Decision, blob_keys: Sequence[str]) -> int:
     """Insert one parsed mail: thread (found or created), participants,
     attachments (metadata + blob key), decision log, thread roll-ups.
@@ -426,6 +454,10 @@ def count_attachments(session: Session) -> int:
 
 def count_payment_threads(session: Session) -> int:
     return session.scalar(select(func.count()).select_from(Thread).where(Thread.has_payment.is_(True))) or 0
+
+
+def count_decisions(session: Session) -> int:
+    return session.scalar(select(func.count()).select_from(DecisionLog)) or 0
 
 
 def count_by_doc_type(session: Session) -> dict[str, int]:

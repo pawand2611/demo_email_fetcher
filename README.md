@@ -51,7 +51,8 @@ DATABASE_URL=postgresql+psycopg://USER:PASSWORD@HOST:5432/DBNAME?sslmode=require
 
 URL-encode special characters in the password (`@` → `%40`, `:` → `%3A`,
 `/` → `%2F`, `%` → `%25`). The database must exist and the user needs
-`CREATE` on it. Then `python check_db.py` connects and creates the tables,
+`CREATE` on it. `DB_SCHEMA=poc` puts the tables in that PostgreSQL schema
+(created if missing) instead of `public`. Then `python check_db.py` connects and creates the tables,
 `python sync_mail.py` fills them, and the app is restarted. The SQLite file
 is left untouched, so switching back is one line.
 
@@ -80,10 +81,21 @@ python sync_mail.py --reclassify       # re-run payment-document rules over the 
 python -m unittest -v                  # unit tests, no mailbox needed
 ```
 
+## What gets stored
+
+By default (`STORE_ONLY_PAYMENT=true`) every fetched message is judged and
+logged in `decision_log`, but only payment documents (statements, invoices,
+receipts) and the threads they belong to are stored. When a thread turns into
+a payment thread, its earlier messages are backfilled from the mailbox. Set
+`STORE_ONLY_PAYMENT=false` to keep every message. The sidebar shows how many
+messages were judged versus stored.
+
 ## How the sync stays idempotent and incremental
 
 - **De-dup key** is the RFC 5322 `Message-ID` (UNIQUE). A message without
   one gets `generated-<sha256 of raw bytes>`, which is just as stable.
+  `decision_log` is checked before anything else, so a message judged once,
+  kept or dropped, is never judged again.
 - **Resume point** is `sync_state.last_seen_uid` per folder. The next run asks
   IMAP for `UID last_seen_uid+1:*` only. A changed `UIDVALIDITY` triggers a
   re-walk, and de-dup makes that safe.

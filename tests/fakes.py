@@ -80,3 +80,15 @@ class FakeMailClient:
         if uid in self._server.fail_fetch:
             raise self._server.fail_fetch[uid]
         return self._server.messages[uid], None
+
+    def find_uid_by_message_id(self, message_id: str) -> int | None:
+        import email
+        from email import policy
+
+        for uid, raw in sorted(self._server.messages.items()):
+            try:
+                if str(email.message_from_bytes(raw, policy=policy.default).get("Message-ID", "")).strip() == message_id:
+                    return uid
+            except Exception:
+                continue
+        return None

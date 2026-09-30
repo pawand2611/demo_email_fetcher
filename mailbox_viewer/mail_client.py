@@ -114,6 +114,16 @@ class MailClient:
             uids = [uid for uid in uids if uid > after_uid]
         return uids
 
+    def find_uid_by_message_id(self, message_id: str) -> int | None:
+        """UID of the message with this Message-ID header in the folder, if any.
+        Used to backfill earlier mail of a thread that was not stored."""
+        status, data = self._command("SEARCH", None, "HEADER", "Message-ID", _quote_search(message_id))
+        if status != "OK":
+            raise MailClientError(f"UID SEARCH by Message-ID failed: {_first(data)}")
+        raw = data[0] if data and data[0] else b""
+        uids = sorted(int(token) for token in raw.split())
+        return uids[-1] if uids else None
+
     def fetch_message(self, uid: int) -> tuple[bytes, datetime | None]:
         """Fetch one message as raw RFC 822 bytes plus the server's INTERNALDATE.
 
@@ -168,6 +178,11 @@ def _quote_mailbox(name: str) -> str:
     if " " in name and not (name.startswith('"') and name.endswith('"')):
         return f'"{name}"'
     return name
+
+
+def _quote_search(value: str) -> str:
+    """Quote a SEARCH argument; Message-IDs contain characters IMAP treats specially."""
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def _first(data) -> str:

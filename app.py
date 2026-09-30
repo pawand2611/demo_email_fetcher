@@ -64,7 +64,16 @@ def main() -> None:
         threads = repo.list_threads(session, payment_only=payment_only, search=search or None)
 
     if total_threads == 0:
-        st.info("No cached mail yet. Click **Refresh** in the sidebar to run the first sync.")
+        with factory() as session:
+            judged = repo.count_decisions(session)
+        if judged:
+            st.info(
+                f"{judged} message(s) were judged and none was a payment document, so nothing is stored. "
+                "Send yourself a PDF named like `statement_sep.pdf` and Refresh, or set "
+                "`STORE_ONLY_PAYMENT=false` in `.env` to keep every message."
+            )
+        else:
+            st.info("No cached mail yet. Click **Refresh** in the sidebar to run the first sync.")
         return
 
     thread_id = render_thread_list(threads, total_threads)
@@ -77,6 +86,7 @@ def render_sidebar(settings: Settings, factory, store: FileSystemStore) -> tuple
         st.header("Mailbox")
         st.caption(f"{settings.imap_user} · {settings.imap_folder}")
         st.caption(f"Attachments → {store.describe()}")
+        st.caption("Keeping: " + ("payment documents and their threads" if settings.store_only_payment else "every message"))
 
         if st.button("🔄 Refresh", type="primary", width="stretch", help="Pull only mail newer than the last sync"):
             with st.spinner("Syncing with the mail server…", show_time=True):
@@ -99,6 +109,7 @@ def render_sidebar(settings: Settings, factory, store: FileSystemStore) -> tuple
             n_emails = repo.count_emails(session)
             n_files = repo.count_attachments(session)
             n_payment = repo.count_payment_threads(session)
+            n_judged = repo.count_decisions(session)
             by_doc = repo.count_by_doc_type(session)
 
         st.divider()
@@ -108,6 +119,7 @@ def render_sidebar(settings: Settings, factory, store: FileSystemStore) -> tuple
         b.metric("Emails", n_emails)
         c.metric("Files", n_files)
         d.metric("Payment", n_payment, help="threads with at least one payment document")
+        st.caption(f"Judged: {n_judged} message(s) in decision_log, {n_judged - n_emails} dropped")
         if by_doc:
             st.caption("Documents: " + ", ".join(f"{k} {v}" for k, v in sorted(by_doc.items())))
         if state is not None and state.last_sync_at is not None:

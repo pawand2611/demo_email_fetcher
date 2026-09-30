@@ -32,6 +32,9 @@ class Settings:
     initial_fetch_limit: int
     attachment_dir: str = "data/attachments"
     db_schema: str | None = None  # PostgreSQL schema for the tables; None = server default (public)
+    # True: keep only payment documents and mail in payment threads; other mail
+    # leaves just a decision_log line. False: keep every message.
+    store_only_payment: bool = True
 
 
 _REQUIRED = ("IMAP_HOST", "IMAP_USER", "IMAP_PASSWORD")
@@ -43,6 +46,7 @@ _DEFAULTS = {
     "DATABASE_URL": "sqlite:///data/mailbox_cache.db",
     "INITIAL_FETCH_LIMIT": "200",
     "ATTACHMENT_DIR": "data/attachments",
+    "STORE_ONLY_PAYMENT": "true",
 }
 
 
@@ -77,11 +81,21 @@ def load_settings(env_file: str | os.PathLike[str] | None = None) -> Settings:
         initial_fetch_limit=_get_int("INITIAL_FETCH_LIMIT"),
         attachment_dir=_get("ATTACHMENT_DIR") or "data/attachments",
         db_schema=db_schema,
+        store_only_payment=_get_bool("STORE_ONLY_PAYMENT"),
     )
 
 
 def _get(key: str) -> str:
     return os.getenv(key, _DEFAULTS.get(key, "")).strip()
+
+
+def _get_bool(key: str) -> bool:
+    raw = _get(key).lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    raise ConfigError(f"{key} must be true or false, got {raw!r}")
 
 
 def _get_int(key: str) -> int:

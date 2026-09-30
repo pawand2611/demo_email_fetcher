@@ -53,6 +53,12 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(ConfigError):
             load(DB_SCHEMA="poc; drop table x")
 
+    def test_store_only_payment_flag(self) -> None:
+        self.assertTrue(load().store_only_payment)
+        self.assertFalse(load(STORE_ONLY_PAYMENT="false").store_only_payment)
+        with self.assertRaises(ConfigError):
+            load(STORE_ONLY_PAYMENT="maybe")
+
     def test_non_integer_port_is_rejected(self) -> None:
         with self.assertRaises(ConfigError):
             load(IMAP_PORT="abc")
