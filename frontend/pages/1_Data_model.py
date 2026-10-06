@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import streamlit as st
 
-from frontend.api_client import ApiClient, ApiError
+from api_client import ApiClient, ApiError
 
 st.set_page_config(page_title="Data model", page_icon="🗂️", layout="wide")
 

@@ -2,7 +2,8 @@
 database, the attachment files and the document model.
 
 Run with:
-    uvicorn backend.main:create_app --factory --host 127.0.0.1 --port 8000
+    cd backend
+    python -m uvicorn api.main:create_app --factory --host 127.0.0.1 --port 8000
 
 There is no authentication in Task 1, so the service must stay bound to
 127.0.0.1. Interactive API docs are at http://127.0.0.1:8000/docs.

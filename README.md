@@ -18,7 +18,7 @@ Streamlit (localhost:8501)  --HTTP-->  Backend API (127.0.0.1:8000)  -->  Postgr
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+pip install -r backend\requirements.txt -r frontend\requirements.txt
 Copy-Item .env.example .env
 ```
 
@@ -30,18 +30,21 @@ Edit `.env`:
    passwords -> create one named "mailbox viewer".
 3. `DATABASE_URL` selects SQLite (default) or PostgreSQL, see below.
 
-`.env` is git-ignored. Never commit it.
+`.env` lives in the repository root and is shared by both services. It is
+git-ignored. Never commit it.
 
 ## Run the app
 
-Two terminals, backend first:
+Two terminals, backend first, each from its own folder:
 
 ```powershell
 # 1. backend API
-.\.venv\Scripts\python.exe -m uvicorn backend.main:create_app --factory --host 127.0.0.1 --port 8000
+cd backend
+..\.venv\Scripts\python.exe -m uvicorn api.main:create_app --factory --host 127.0.0.1 --port 8000
 
 # 2. frontend
-.\.venv\Scripts\python.exe -m streamlit run app.py
+cd frontend
+..\.venv\Scripts\python.exe -m streamlit run app.py
 ```
 
 The backend has no login (Task 1 forbids it), so it must stay bound to
@@ -88,14 +91,15 @@ DATABASE_URL=postgresql+psycopg://USER:PASSWORD@HOST:5432/DBNAME?sslmode=require
 URL-encode special characters in the password (`@` → `%40`, `:` → `%3A`,
 `/` → `%2F`, `%` → `%25`). The database must exist and the user needs
 `CREATE` on it. `DB_SCHEMA=poc` puts the tables in that PostgreSQL schema
-(created if missing) instead of `public`. Then `python check_db.py` connects
-and creates the tables, and the backend is restarted. The SQLite file is left
+(created if missing) instead of `public`. Then `python check_db.py` (from
+`backend/`) connects and creates the tables, and the backend is restarted. The SQLite file is left
 untouched, so switching back is one line.
 
 ## Where attachments are stored
 
 Metadata in the `attachments` table; bytes on disk under
-`ATTACHMENT_DIR/<sha256>/<filename>` (default `data/attachments/`), with the
+`ATTACHMENT_DIR/<sha256>/<filename>` (default `data/attachments/`, relative
+to `backend/`, so `backend/data/attachments/`), with the
 relative path stored as `blob_key`. Identical files are stored once. Pure
 Python, no services, nothing leaves the machine. Back up the folder together
 with the database.
@@ -107,6 +111,8 @@ alerts on managed machines. Do not reintroduce it here.
 
 ## Command-line tools
 
+Backend maintenance scripts, run from `backend/`:
+
 ```powershell
 python check_db.py                     # connect to DATABASE_URL, create tables, print counts
 python create_schema.py --ddl sqlite   # print the schema DDL (or postgresql); --drop rebuilds tables
@@ -114,8 +120,11 @@ python fetch_mail.py --limit 10        # M0: connect and print, no database
 python sync_mail.py                    # one sync run, prints counts before/after
 python sync_mail.py --reset-state      # forget the resume point and re-walk (still 0 new)
 python sync_mail.py --reclassify       # re-run the document model over the cache only
-python -m unittest -v                  # unit tests, no mailbox needed
+python -m unittest -v                  # backend tests, no mailbox needed
 ```
+
+Frontend tests, run from `frontend/`: `python -m unittest -v` (they stub the
+backend, so neither the API nor the mailbox is needed).
 
 ## Folders and what gets stored
 
@@ -163,39 +172,45 @@ every message is still stored. The LayoutLMv3 adapter is added in
 It must load from the local folder with Hugging Face offline mode and
 telemetry disabled; weights stay out of git.
 
-Full design and ERD: [docs/SCHEMA.md](docs/SCHEMA.md).
+Full design and ERD: [backend/SCHEMA.md](backend/SCHEMA.md).
 
 ## Layout
 
 ```
-backend/                    the API service (only process that touches mail, DB, files, model)
-  main.py                   FastAPI app factory and routes
-  schemas.py                response models
-  jobs.py                   background sync jobs, one at a time
-frontend/
-  api_client.py             HTTP client the Streamlit pages use
-app.py                      Streamlit inbox (threads, messages, attachments, decisions)
-pages/1_Data_model.py       the six-table model with DDL, from the API
-pages/2_Tables.py           browse the rows of every table, from the API
-check_db.py                 database connectivity check
-create_schema.py            create / drop the schema, print DDL
-fetch_mail.py               M0 script: connect, fetch, print
-sync_mail.py                run one sync and print counts
-mailbox_viewer/
-  config.py                 settings from .env / environment, nothing hardcoded
-  mail_client.py            IMAP session: search UIDs, fetch raw bytes
-  mail_parser.py            raw bytes -> ParsedEmail (headers, participants, bodies, attachments)
-  threads.py                conversation key from threading headers
-  classifier.py             model-based classification and decision
-  document_model.py         loads the trained document model (LayoutLMv3 slot)
-  attachment_store.py       file-system store for attachment bytes
-  models.py                 SQLAlchemy models: threads, emails, email_participants,
-                            attachments, sync_state, decision_log
-  db.py                     engine / session factory
-  repository.py             every database read and write
-  sync.py                   the sync run: fetch, de-dup, thread, classify, persist
-docs/SCHEMA.md              schema design, ERD, refresh flow, history
-tests/                      unit tests (parser, threads, classifier, store, sync, schema, API, client)
+backend/                      the API service: the only part that touches mail, database, files, model
+  api/
+    main.py                   FastAPI app factory and routes
+    schemas.py                response models
+    jobs.py                   background sync jobs, one at a time
+  mailbox_viewer/
+    config.py                 settings from .env / environment, nothing hardcoded
+    mail_client.py            IMAP session: search UIDs, fetch raw bytes
+    mail_parser.py            raw bytes -> ParsedEmail (headers, participants, bodies, attachments)
+    threads.py                conversation key from threading headers
+    classifier.py             model-based classification and decision
+    document_model.py         loads the trained document model (LayoutLMv3 slot)
+    attachment_store.py       file-system store for attachment bytes
+    models.py                 SQLAlchemy models: threads, emails, email_participants,
+                              attachments, sync_state, decision_log
+    db.py                     engine / session factory
+    repository.py             every database read and write
+    sync.py                   the sync run: fetch, de-dup, thread, classify, persist
+  check_db.py                 database connectivity check
+  create_schema.py            create / drop the schema, print DDL
+  fetch_mail.py               M0 script: connect, fetch, print
+  sync_mail.py                run one sync and print counts
+  tests/                      parser, threads, classifier, store, sync, schema, API
+  SCHEMA.md                   schema design, ERD, refresh flow, history
+  requirements.txt
+  data/                       attachment files (git-ignored)
+frontend/                     Streamlit, talks to the backend over HTTP only
+  app.py                      inbox: threads, messages, attachments, decisions
+  pages/1_Data_model.py       the six-table model with DDL
+  pages/2_Tables.py           browse the rows of every table
+  api_client.py               HTTP client the pages use
+  tests/                      client tests against a stubbed backend
+  requirements.txt
+README.md, .env.example, .gitignore
 ```
 
 ## Out of scope by design

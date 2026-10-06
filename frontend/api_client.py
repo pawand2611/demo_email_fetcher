@@ -15,7 +15,7 @@ import httpx
 from dotenv import load_dotenv
 
 DEFAULT_API_URL = "http://127.0.0.1:8000"
-START_HINT = "uvicorn backend.main:create_app --factory --host 127.0.0.1 --port 8000"
+START_HINT = "cd backend; python -m uvicorn api.main:create_app --factory --host 127.0.0.1 --port 8000"
 
 
 class ApiError(RuntimeError):

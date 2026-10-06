@@ -1,5 +1,5 @@
 """Backend API end to end, in-process: temporary SQLite, fake IMAP server,
-fake document model. Also exercises the frontend's ApiClient against it."""
+fake document model."""
 
 from __future__ import annotations
 
@@ -10,8 +10,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from backend.main import Services, create_app
-from frontend.api_client import ApiClient, ApiError
+from api.main import Services, create_app
 from mailbox_viewer.attachment_store import FileSystemStore
 from mailbox_viewer.config import Settings
 from mailbox_viewer.db import init_db, make_engine, make_session_factory
@@ -188,44 +187,6 @@ class ApiTests(unittest.TestCase):
             self.assertEqual(self.client.post("/reclassify").status_code, 409)
         finally:
             jobs._running = None
-
-
-class ApiClientTests(unittest.TestCase):
-    """The frontend's client, pointed at the in-process app."""
-
-    def setUp(self) -> None:
-        self.api_tests = ApiTests("test_health_and_profile")
-        self.api_tests.setUp()
-        self.api = ApiClient(base_url="http://testserver", http=self.api_tests.client)
-
-    def tearDown(self) -> None:
-        self.api_tests.tearDown()
-
-    def test_client_round_trip(self) -> None:
-        self.api_tests.seed()
-        job = self.api.start_sync()
-        self.api_tests.app.state.jobs.get(job["id"]).done.wait(10)
-        self.assertEqual(self.api.sync_job(job["id"])["state"], "succeeded")
-
-        threads = self.api.threads(search="acme")
-        self.assertEqual([t["subject"] for t in threads], ["Invoice #42"])
-        detail = self.api.thread(threads[0]["id"])
-        att = detail["messages"][-1]["attachments"][0]
-        self.assertEqual(self.api.attachment_bytes(att["id"]), PDF)
-        self.assertEqual(self.api.stats()["emails"], 3)
-        self.assertIn("CREATE TABLE", self.api.ddl("sqlite"))
-        self.assertEqual(self.api.table_rows("threads", limit=1)["total"], 2)
-
-    def test_errors_become_api_errors(self) -> None:
-        with self.assertRaises(ApiError) as ctx:
-            self.api.thread(999)
-        self.assertEqual(ctx.exception.status_code, 404)
-
-    def test_unreachable_backend_explains_how_to_start_it(self) -> None:
-        api = ApiClient(base_url="http://127.0.0.1:9")  # nothing listens on the discard port
-        with self.assertRaises(ApiError) as ctx:
-            api.health()
-        self.assertIn("uvicorn backend.main:create_app", str(ctx.exception))
 
 
 if __name__ == "__main__":

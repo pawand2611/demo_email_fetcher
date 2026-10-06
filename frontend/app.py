@@ -3,9 +3,9 @@
 It talks only to the backend API (``API_URL``, default http://127.0.0.1:8000);
 it never opens the database or the mailbox itself.
 
-Run with (backend first):
-    uvicorn backend.main:create_app --factory --host 127.0.0.1 --port 8000
-    streamlit run app.py
+Run with (backend first, each from its own folder):
+    cd backend;  python -m uvicorn api.main:create_app --factory --host 127.0.0.1 --port 8000
+    cd frontend; python -m streamlit run app.py
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 
-from frontend.api_client import ApiClient, ApiError, parse_time
+from api_client import ApiClient, ApiError, parse_time
 
 st.set_page_config(page_title="Mailbox Viewer", page_icon="📬", layout="wide")
 
