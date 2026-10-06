@@ -20,7 +20,7 @@ from mailbox_viewer.mail_client import MailClientError, MailConnectionLost
 from mailbox_viewer.models import Attachment, DecisionLog, Email, EmailParticipant, Thread
 from mailbox_viewer.sync import STATUS_FAILED, STATUS_OK, STATUS_PARTIAL, run_sync
 
-from .fakes import FakeMailClient, FakeMailServer, build_message
+from .fakes import FakeDocumentModel, FakeMailClient, FakeMailServer, build_message
 
 PDF = b"%PDF-1.4 pretend statement"
 
@@ -48,6 +48,7 @@ class SyncTests(unittest.TestCase):
         self.server = FakeMailServer()
         self.servers: dict[str, FakeMailServer] = {}  # extra folders for multi-folder tests
         self.store = FileSystemStore(self.att_dir)
+        self.model = FakeDocumentModel()
 
     def tearDown(self) -> None:
         self.engine.dispose()
@@ -72,7 +73,7 @@ class SyncTests(unittest.TestCase):
 
     def sync(self, **overrides):
         settings = dataclasses.replace(self.settings, **overrides)
-        return run_sync(settings, self.factory, lambda _s, folder: FakeMailClient(self.servers.get(folder, self.server), folder), store=self.store)
+        return run_sync(settings, self.factory, lambda _s, folder: FakeMailClient(self.servers.get(folder, self.server), folder), store=self.store, model=self.model)
 
     def counts(self) -> tuple[int, int, int, int]:
         with self.factory() as session:
@@ -249,7 +250,7 @@ class SyncTests(unittest.TestCase):
             session.execute(update(DecisionLog).values(decision="none", tier=0))
 
         with self.factory() as session, session.begin():
-            changed = repo.reclassify_all(session)
+            changed = repo.reclassify_all(session, self.store, self.model)
 
         self.assertEqual(changed, 1)
         self.assertEqual(self.counts()[3], 1)
@@ -257,7 +258,7 @@ class SyncTests(unittest.TestCase):
             self.assertEqual(session.get(DecisionLog, "<m2@x>").decision, "payment")
             self.assertEqual(repo.count_by_decision(session), {"payment": 1, "none": 2})
         with self.factory() as session, session.begin():
-            self.assertEqual(repo.reclassify_all(session), 0)
+            self.assertEqual(repo.reclassify_all(session, self.store, self.model), 0)
 
     # -- resilience ---------------------------------------------------------------------
 
@@ -321,7 +322,7 @@ class SyncTests(unittest.TestCase):
                 raise MailClientError("no such folder")
             return FakeMailClient(self.server, folder)
 
-        result = run_sync(dataclasses.replace(self.settings, imap_folders=("INBOX", "BROKEN")), self.factory, factory, store=self.store)
+        result = run_sync(dataclasses.replace(self.settings, imap_folders=("INBOX", "BROKEN")), self.factory, factory, store=self.store, model=self.model)
         self.assertEqual(result.status, STATUS_FAILED)
         self.assertIn("BROKEN", result.error)
         self.assertEqual(result.kept, 3)

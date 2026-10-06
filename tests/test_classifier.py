@@ -1,4 +1,4 @@
-"""Tiered payment-document detection on hand-built MailFacts."""
+"""Model-based classification with a fake document model; no keyword rules."""
 
 from __future__ import annotations
 
@@ -7,99 +7,97 @@ import unittest
 from mailbox_viewer.classifier import (
     DECISION_NONE,
     DECISION_PAYMENT,
-    DOC_INVOICE,
-    DOC_OTHER,
-    DOC_RECEIPT,
-    DOC_STATEMENT,
-    TIER_BODY,
-    TIER_FILENAME,
+    TIER_MODEL,
     TIER_NONE,
-    TIER_SUBJECT,
-    AttachmentFacts,
-    KeywordMatcher,
-    MailFacts,
+    AttachmentInput,
+    NoModel,
+    Prediction,
     classify,
-    is_document,
+    is_model_input,
 )
 
-
-def att(filename: str, content_type: str) -> AttachmentFacts:
-    return AttachmentFacts(filename=filename, content_type=content_type)
+from .fakes import FakeDocumentModel
 
 
-def facts(subject: str = "", body: str = "", attachments: tuple[AttachmentFacts, ...] = ()) -> MailFacts:
-    return MailFacts(subject=subject, body_text=body, attachments=attachments)
+def pdf(name: str, data: bytes = b"%PDF-1.4") -> AttachmentInput:
+    return AttachmentInput(name, "application/pdf", data)
 
 
-class TierTests(unittest.TestCase):
-    def test_tier1_filename_names_the_type_and_flags_only_that_file(self) -> None:
-        result = classify(facts(subject="Documents", attachments=(att("holiday.pdf", "application/pdf"), att("Card_Statement_Sep.pdf", "application/pdf"))))
+class ClassifyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.model = FakeDocumentModel()
 
-        self.assertEqual((result.doc_type, result.tier, result.confidence, result.decision), (DOC_STATEMENT, TIER_FILENAME, 0.95, DECISION_PAYMENT))
-        self.assertIn('attachment "Card_Statement_Sep.pdf" contains "card statement"', result.reason)
-        self.assertEqual([a.doc_type for a in result.attachments], [DOC_OTHER, DOC_STATEMENT])
-        self.assertEqual([a.confidence for a in result.attachments], [0.30, 0.95])
+    def test_payment_label_above_threshold_is_payment(self) -> None:
+        result = classify([pdf("statement_aug.pdf")], self.model)
 
-    def test_tier2_subject_labels_every_document(self) -> None:
-        result = classify(facts(subject="Your invoice for March", attachments=(att("a.pdf", "application/pdf"), att("b.csv", "text/csv"), att("logo.png", "image/png"))))
+        self.assertEqual((result.doc_type, result.tier, result.confidence, result.decision), ("statement", TIER_MODEL, 0.95, DECISION_PAYMENT))
+        self.assertEqual(result.reason, 'model fake: "statement_aug.pdf" is statement (0.95)')
+        self.assertEqual([(a.doc_type, a.confidence) for a in result.attachments], [("statement", 0.95)])
 
-        self.assertEqual((result.doc_type, result.tier, result.confidence), (DOC_INVOICE, TIER_SUBJECT, 0.80))
-        self.assertEqual([a.doc_type for a in result.attachments], [DOC_INVOICE, DOC_INVOICE, None])
-        self.assertTrue(result.is_payment)
+    def test_strongest_payment_prediction_wins_and_each_file_keeps_its_label(self) -> None:
+        self.model.overrides["a.pdf"] = Prediction("invoice", 0.70)
+        self.model.overrides["b.pdf"] = Prediction("statement", 0.90)
+        result = classify([pdf("a.pdf"), pdf("b.pdf"), AttachmentInput("rows.csv", "text/csv", b"a,b")], self.model)
 
-    def test_tier3_body(self) -> None:
-        result = classify(facts(subject="September", body="Please find the payment receipt attached.", attachments=(att("doc.pdf", "application/pdf"),)))
+        self.assertEqual((result.doc_type, result.confidence), ("statement", 0.90))
+        self.assertEqual([a.doc_type for a in result.attachments], ["invoice", "statement", None])
 
-        self.assertEqual((result.doc_type, result.tier, result.confidence), (DOC_RECEIPT, TIER_BODY, 0.60))
-        self.assertIn("body contains", result.reason)
+    def test_payment_label_below_threshold_is_recorded_but_not_payment(self) -> None:
+        self.model.overrides["x.pdf"] = Prediction("invoice", 0.40)
+        result = classify([pdf("x.pdf")], self.model, min_confidence=0.5)
 
-    def test_document_without_keyword_is_other_and_not_payment(self) -> None:
-        result = classify(facts(subject="Holiday photos list", attachments=(att("list.pdf", "application/pdf"),)))
+        self.assertEqual((result.doc_type, result.tier, result.decision), ("invoice", TIER_MODEL, DECISION_NONE))
+        self.assertIn("below the 0.50 threshold", result.reason)
 
-        self.assertEqual((result.doc_type, result.tier, result.confidence, result.decision), (DOC_OTHER, TIER_NONE, 0.30, DECISION_NONE))
-        self.assertEqual(result.attachments[0].doc_type, DOC_OTHER)
+    def test_non_payment_label_is_not_payment(self) -> None:
+        result = classify([pdf("holiday.pdf")], self.model)
 
-    def test_keyword_without_document_is_a_notice_not_a_document(self) -> None:
-        result = classify(facts(subject="Your statement is ready to view online"))
+        self.assertEqual((result.doc_type, result.decision), ("other", DECISION_NONE))
+        self.assertIn("not a payment document", result.reason)
+
+    def test_no_model_configured_leaves_documents_unclassified(self) -> None:
+        result = classify([pdf("statement_aug.pdf")], NoModel())
 
         self.assertEqual((result.doc_type, result.tier, result.confidence, result.decision), (None, TIER_NONE, None, DECISION_NONE))
-        self.assertIn("no document is attached", result.reason)
+        self.assertEqual(result.reason, "no classification model configured; 1 document(s) left unclassified")
 
-    def test_plain_mail(self) -> None:
-        result = classify(facts(subject="Lunch tomorrow?"))
+    def test_no_document_attachment(self) -> None:
+        result = classify([AttachmentInput("rows.csv", "text/csv", b"a,b")], self.model)
+        self.assertEqual((result.doc_type, result.decision, result.reason), (None, DECISION_NONE, "no PDF or image attachment for the model"))
+        self.assertEqual(classify([], self.model).attachments, ())
 
-        self.assertEqual((result.doc_type, result.decision), (None, DECISION_NONE))
-        self.assertEqual(result.attachments, ())
+    def test_missing_bytes_are_skipped(self) -> None:
+        result = classify([AttachmentInput("statement.pdf", "application/pdf", None)], self.model)
+        self.assertEqual(result.tier, TIER_NONE)
+        self.assertEqual(self.model.calls, [])
 
-    def test_image_attachment_does_not_count_as_document(self) -> None:
-        result = classify(facts(subject="invoice", attachments=(att("shot.png", "image/png"),)))
+    def test_model_error_on_one_file_does_not_stop_the_others(self) -> None:
+        self.model.fail_on.add("broken.pdf")
+        result = classify([pdf("broken.pdf"), pdf("invoice_9.pdf")], self.model)
 
-        self.assertEqual(result.decision, DECISION_NONE)
-        self.assertEqual(result.attachments[0].doc_type, None)
+        self.assertEqual((result.doc_type, result.decision), ("invoice", DECISION_PAYMENT))
+        self.assertEqual([a.doc_type for a in result.attachments], [None, "invoice"])
 
-    def test_family_precedence_statement_before_invoice(self) -> None:
-        result = classify(facts(subject="Invoice and account statement", attachments=(att("x.pdf", "application/pdf"),)))
-        self.assertEqual(result.doc_type, DOC_STATEMENT)
+    def test_only_errors_reports_them(self) -> None:
+        self.model.fail_on.add("broken.pdf")
+        result = classify([pdf("broken.pdf")], self.model)
+        self.assertEqual(result.reason, "model fake could not classify 1 document(s) (1 error(s))")
 
-    def test_word_boundaries(self) -> None:
-        self.assertEqual(classify(facts(subject="Billion dollar footprint", attachments=(att("x.pdf", "application/pdf"),))).doc_type, DOC_OTHER)
-        self.assertEqual(classify(facts(subject="Bills for March", attachments=(att("x.pdf", "application/pdf"),))).doc_type, DOC_INVOICE)
+    def test_labels_are_normalised_and_scores_clamped(self) -> None:
+        self.model.overrides["x.pdf"] = Prediction("  Statement ", 1.7)
+        result = classify([pdf("x.pdf")], self.model)
+        self.assertEqual((result.doc_type, result.confidence), ("statement", 1.0))
 
-    def test_is_document_falls_back_to_extension(self) -> None:
-        self.assertTrue(is_document(att("Statement.XLSX", "application/octet-stream")))
-        self.assertTrue(is_document(att("noext", "application/pdf")))
-        self.assertFalse(is_document(att("archive.zip", "application/zip")))
+    def test_with_note_appends_to_reason(self) -> None:
+        result = classify([pdf("holiday.pdf")], self.model).with_note("kept as part of a payment thread")
+        self.assertTrue(result.reason.endswith("; kept as part of a payment thread"))
 
-
-class KeywordMatcherTests(unittest.TestCase):
-    def test_reports_canonical_keyword_for_plurals_and_separators(self) -> None:
-        matcher = KeywordMatcher(("card statement", "statement", "bill"))
-
-        self.assertEqual(matcher.find("Card_Statement_Sep.pdf"), "card statement")
-        self.assertEqual(matcher.find("Your statements are ready"), "statement")
-        self.assertEqual(matcher.find("Bills due"), "bill")
-        self.assertIsNone(matcher.find("Billion"))
-        self.assertIsNone(matcher.find(""))
+    def test_model_reads_pdfs_and_images_only(self) -> None:
+        self.assertTrue(is_model_input(AttachmentInput("scan.jpg", "image/jpeg")))
+        self.assertTrue(is_model_input(AttachmentInput("doc", "application/pdf")))
+        self.assertTrue(is_model_input(AttachmentInput("Scan.PNG", "application/octet-stream")))
+        self.assertFalse(is_model_input(AttachmentInput("rows.csv", "text/csv")))
+        self.assertFalse(is_model_input(AttachmentInput("book.xlsx", "application/vnd.ms-excel")))
 
 
 if __name__ == "__main__":

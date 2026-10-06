@@ -16,7 +16,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from .attachment_store import AttachmentStoreError, FileSystemStore
-from .classifier import AttachmentFacts, Decision, MailFacts, classify
+from .classifier import AttachmentInput, Decision, DocumentModel, classify
 from .mail_parser import ParsedEmail
 from .models import Attachment, DecisionLog, Email, EmailParticipant, SyncState, Thread, to_naive_utc, utcnow_naive
 from .threads import ancestor_ids, conversation_key
@@ -244,19 +244,19 @@ def _log_decision(session: Session, message_id: str, decision: Decision) -> None
     log.decided_at = utcnow_naive()
 
 
-def reclassify_all(session: Session) -> int:
-    """Re-run the rules over every cached mail using only stored columns.
-    Updates emails, attachments, decision_log and thread roll-ups. Returns
-    how many emails changed."""
+def reclassify_all(session: Session, store: FileSystemStore, model: DocumentModel, min_confidence: float = 0.5) -> int:
+    """Re-run the document model over every cached mail. Attachment bytes come
+    from the file store; the mail server is never contacted. Updates emails,
+    attachments, decision_log and thread roll-ups. Returns how many emails
+    changed."""
     changed = 0
     rows = session.scalars(select(Email).options(selectinload(Email.attachments))).all()
     for row in rows:
-        facts = MailFacts(
-            subject=row.subject,
-            body_text=row.body_text,
-            attachments=tuple(AttachmentFacts(a.filename, a.content_type) for a in row.attachments),
+        inputs = tuple(
+            AttachmentInput(a.filename, a.content_type, store.get(a.blob_key) if store.exists(a.blob_key) else None)
+            for a in row.attachments
         )
-        decision = classify(facts)
+        decision = classify(inputs, model, min_confidence)
         before = (row.doc_type, row.confidence, row.decision_reason, row.matched_directly)
         row.doc_type = decision.doc_type
         row.confidence = decision.confidence
@@ -290,8 +290,11 @@ def list_threads(
     payment_only: bool = False,
     search: str | None = None,
     limit: int = 1000,
+    thread_id: int | None = None,
 ) -> list[ThreadSummary]:
     stmt = select(Thread)
+    if thread_id is not None:
+        stmt = stmt.where(Thread.id == thread_id)
     if payment_only:
         stmt = stmt.where(Thread.has_payment.is_(True))
     if search:
@@ -347,6 +350,16 @@ def list_threads(
         )
         for t in threads
     ]
+
+
+def get_thread(session: Session, thread_id: int) -> ThreadSummary | None:
+    found = list_threads(session, thread_id=thread_id, limit=1)
+    return found[0] if found else None
+
+
+def get_attachment(session: Session, attachment_id: int) -> AttachmentInfo | None:
+    row = session.get(Attachment, attachment_id)
+    return _attachment_info(row) if row else None
 
 
 def list_thread_emails(session: Session, thread_id: int) -> list[EmailSummary]:

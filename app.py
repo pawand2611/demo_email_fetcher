@@ -1,132 +1,109 @@
-"""Streamlit UI: inbox by thread, message detail, attachments, decisions.
+"""Streamlit frontend: inbox by thread, message detail, attachments, decisions.
 
-Every render reads only from the database. The mail server is contacted in
-exactly one place: the Refresh button, which runs an incremental sync behind
-a spinner.
+It talks only to the backend API (``API_URL``, default http://127.0.0.1:8000);
+it never opens the database or the mailbox itself.
 
-Run with:  streamlit run app.py
+Run with (backend first):
+    uvicorn backend.main:create_app --factory --host 127.0.0.1 --port 8000
+    streamlit run app.py
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import time
+from datetime import datetime
 
 import pandas as pd
 import streamlit as st
 
-from mailbox_viewer import repository as repo
-from mailbox_viewer.attachment_store import FileSystemStore, build_store
-from mailbox_viewer.config import ConfigError, Settings, load_settings
-from mailbox_viewer.db import init_db, make_engine, make_session_factory
-from mailbox_viewer.sync import STATUS_OK, STATUS_PARTIAL, SyncResult, run_sync
+from frontend.api_client import ApiClient, ApiError, parse_time
 
 st.set_page_config(page_title="Mailbox Viewer", page_icon="📬", layout="wide")
 
 DOC_COLORS = {"statement": "green", "invoice": "violet", "receipt": "blue", "other": "gray"}
+PAYMENT_TYPES = ("statement", "invoice", "receipt")
 
 
 @st.cache_resource(show_spinner=False)
-def get_settings() -> Settings:
-    return load_settings()
-
-
-@st.cache_resource(show_spinner=False)
-def get_session_factory():
-    settings = get_settings()
-    engine = make_engine(settings.database_url, settings.db_schema)
-    init_db(engine, settings.db_schema)
-    return make_session_factory(engine)
-
-
-@st.cache_resource(show_spinner=False)
-def get_store() -> FileSystemStore:
-    return build_store(get_settings())
+def get_api() -> ApiClient:
+    return ApiClient()
 
 
 # -- page ------------------------------------------------------------------------------
 
 
 def main() -> None:
+    api = get_api()
     try:
-        settings = get_settings()
-        factory = get_session_factory()
-        store = get_store()
-    except ConfigError as exc:
-        st.error(f"Configuration error: {exc}")
+        profile = api.profiles()[0]
+        payment_only, search = render_sidebar(api, profile)
+        st.title("📬 Mailbox Viewer")
+        stats = api.stats()
+        threads = api.threads(payment_only=payment_only, search=search or None)
+    except ApiError as exc:
+        st.error(str(exc))
         st.stop()
 
-    payment_only, search = render_sidebar(settings, factory, store)
-
-    st.title("📬 Mailbox Viewer")
-
-    with factory() as session:
-        total_threads = repo.count_threads(session)
-        threads = repo.list_threads(session, payment_only=payment_only, search=search or None)
-
-    if total_threads == 0:
-        with factory() as session:
-            judged = repo.count_decisions(session)
-        if judged:
+    if stats["threads"] == 0:
+        if stats["judged"]:
             st.info(
-                f"{judged} message(s) were judged and none was a payment document, so nothing is stored. "
-                "Send yourself a PDF named like `statement_sep.pdf` and Refresh, or set "
-                "`STORE_ONLY_PAYMENT=false` in `.env` to keep every message."
+                f"{stats['judged']} message(s) were judged and none was kept. With `STORE_ONLY_PAYMENT=true` only "
+                "payment documents are stored; set it to `false` in `.env` and restart the backend to keep every message."
             )
         else:
             st.info("No cached mail yet. Click **Refresh** in the sidebar to run the first sync.")
         return
 
-    thread_id = render_thread_list(threads, total_threads)
+    thread_id = render_thread_list(threads, stats["threads"])
     if thread_id is not None:
-        render_thread(factory, store, thread_id)
+        render_thread(api, thread_id)
 
 
-def render_sidebar(settings: Settings, factory, store: FileSystemStore) -> tuple[bool, str]:
+def render_sidebar(api: ApiClient, profile: dict) -> tuple[bool, str]:
     with st.sidebar:
         st.header("Mailbox")
-        st.caption(f"{settings.imap_user} · " + ", ".join(settings.imap_folders))
-        st.caption(f"Attachments → {store.describe()}")
-        st.caption("Keeping: " + ("payment documents and their threads" if settings.store_only_payment else "every message"))
+        st.caption(f"{profile['mailbox']} · " + ", ".join(profile["folders"]))
+        st.caption(f"Profile: {profile['name']} · model: {profile['model']}")
+        st.caption(f"Attachments → {profile['attachment_store']}")
+        st.caption("Keeping: " + ("payment documents and their threads" if profile["keep_policy"] == "payment_only" else "every message"))
 
         if st.button("🔄 Refresh", type="primary", width="stretch", help="Pull only mail newer than the last sync"):
+            job = api.start_sync()
             with st.spinner("Syncing with the mail server…", show_time=True):
-                result = run_sync(settings, factory, store=store)
-            st.session_state["last_sync_result"] = result
+                while job["state"] == "running":
+                    time.sleep(1)
+                    job = api.sync_job(job["id"])
+            st.session_state["last_sync_job"] = job
 
-        result: SyncResult | None = st.session_state.get("last_sync_result")
-        if result is not None:
-            _show_sync_result(result)
+        job = st.session_state.get("last_sync_job")
+        if job is not None:
+            _show_sync_job(job)
 
-        if st.button("🏷️ Re-run classification rules", width="stretch", help="Re-label cached mail with the current rules; no mail-server contact."):
-            with st.spinner("Re-applying rules…"):
-                with factory() as session, session.begin():
-                    changed = repo.reclassify_all(session)
-            st.info(f"Rules re-applied: {changed} email(s) changed.")
+        if st.button("🏷️ Re-run classifier", width="stretch", help="Re-run the document model over cached mail; no mail-server contact."):
+            try:
+                with st.spinner("Re-running the document model…"):
+                    out = api.reclassify()
+                st.info(f"Model {out['model']} re-applied: {out['changed']} email(s) changed.")
+            except ApiError as exc:
+                st.warning(str(exc))
 
-        with factory() as session:
-            states = {f: repo.get_sync_state(session, f) for f in settings.imap_folders}
-            n_threads = repo.count_threads(session)
-            n_emails = repo.count_emails(session)
-            n_files = repo.count_attachments(session)
-            n_payment = repo.count_payment_threads(session)
-            n_judged = repo.count_decisions(session)
-            by_doc = repo.count_by_doc_type(session)
-
+        stats = api.stats()
         st.divider()
         st.subheader("Cache")
         a, b, c, d = st.columns(4)
-        a.metric("Threads", n_threads)
-        b.metric("Emails", n_emails)
-        c.metric("Files", n_files)
-        d.metric("Payment", n_payment, help="threads with at least one payment document")
-        st.caption(f"Judged: {n_judged} message(s) in decision_log, {n_judged - n_emails} dropped")
-        if by_doc:
-            st.caption("Documents: " + ", ".join(f"{k} {v}" for k, v in sorted(by_doc.items())))
-        for folder, state in states.items():
-            if state is not None and state.last_sync_at is not None:
-                st.caption(f"{folder}: last sync {_fmt_local(state.last_sync_at)} · resume after UID {state.last_seen_uid}")
+        a.metric("Threads", stats["threads"])
+        b.metric("Emails", stats["emails"])
+        c.metric("Files", stats["attachments"])
+        d.metric("Payment", stats["payment_threads"], help="threads with at least one payment document")
+        st.caption(f"Judged: {stats['judged']} message(s) in decision_log, {stats['dropped']} dropped")
+        if stats["by_doc_type"]:
+            st.caption("Documents: " + ", ".join(f"{k} {v}" for k, v in sorted(stats["by_doc_type"].items())))
+        for state in stats["sync_states"]:
+            when = parse_time(state["last_sync_at"])
+            if when:
+                st.caption(f"{state['folder_name']}: last sync {_fmt(when)} · resume after UID {state['last_seen_uid']}")
             else:
-                st.caption(f"{folder}: never synced.")
+                st.caption(f"{state['folder_name']}: never synced.")
 
         st.divider()
         st.subheader("Filter")
@@ -136,21 +113,21 @@ def render_sidebar(settings: Settings, factory, store: FileSystemStore) -> tuple
     return payment_only, search
 
 
-def render_thread_list(threads: list[repo.ThreadSummary], total: int) -> int | None:
-    st.caption(f"Showing {len(threads)} of {total} conversations. Read from the local cache, never from the mail server.")
+def render_thread_list(threads: list[dict], total: int) -> int | None:
+    st.caption(f"Showing {len(threads)} of {total} conversations, served by the backend from its cache.")
     if not threads:
         st.warning("No conversations match the current filter.")
         return None
 
     table = pd.DataFrame(
         {
-            "id": [t.id for t in threads],
-            "Last message": [_to_local_naive(t.last_message_at) for t in threads],
-            "From": [t.participants for t in threads],
-            "Subject": [t.subject or "(no subject)" for t in threads],
-            "Msgs": [t.message_count for t in threads],
-            "Files": [t.attachment_count for t in threads],
-            "Payment": [t.has_payment for t in threads],
+            "id": [t["id"] for t in threads],
+            "Last message": [parse_time(t["last_message_at"]) for t in threads],
+            "From": [t["participants"] for t in threads],
+            "Subject": [t["subject"] or "(no subject)" for t in threads],
+            "Msgs": [t["message_count"] for t in threads],
+            "Files": [t["attachment_count"] for t in threads],
+            "Payment": [t["has_payment"] for t in threads],
         }
     )
     event = st.dataframe(
@@ -176,76 +153,71 @@ def render_thread_list(threads: list[repo.ThreadSummary], total: int) -> int | N
     return int(table.iloc[rows[0]]["id"])
 
 
-def render_thread(factory, store: FileSystemStore, thread_id: int) -> None:
-    with factory() as session:
-        emails = repo.list_thread_emails(session, thread_id)
-    if not emails:
-        st.warning("That conversation is no longer in the cache.")
+def render_thread(api: ApiClient, thread_id: int) -> None:
+    try:
+        thread = api.thread(thread_id)
+    except ApiError as exc:
+        st.warning(str(exc))
         return
 
     st.divider()
-    st.subheader(emails[0].subject or "(no subject)")
-    st.caption(f"{len(emails)} message(s) in this conversation, newest first.")
-
-    for summary in emails:
-        with factory() as session:
-            detail = repo.get_email_detail(session, summary.id)
-            files = repo.get_attachment_files(session, summary.id, store) if detail and detail.attachments else []
-            decision = repo.get_decision(session, summary.message_id)
-        if detail is None:
-            continue
-        render_message(detail, files, decision, expanded=summary is emails[0])
+    st.subheader(thread["subject"] or "(no subject)")
+    st.caption(f"{thread['message_count']} message(s) in this conversation, newest first.")
+    for index, message in enumerate(thread["messages"]):
+        render_message(api, message, expanded=index == 0)
 
 
-def render_message(detail: repo.EmailDetail, files: list[repo.AttachmentFile], decision: repo.DecisionInfo | None, *, expanded: bool) -> None:
-    sender = detail.by_role("from")
-    head = f"{_fmt_local(detail.received_at)} · {sender[0].display if sender else '(unknown sender)'}"
-    if detail.doc_type:
-        head += f" · {detail.doc_type}"
+def render_message(api: ApiClient, m: dict, *, expanded: bool) -> None:
+    people = {role: [p for p in m["participants"] if p["role"] == role] for role in ("from", "to", "cc", "bcc")}
+    sender = people["from"][0] if people["from"] else None
+    head = f"{_fmt(parse_time(m['received_at']))} · {_display(sender) if sender else '(unknown sender)'}"
+    if m["doc_type"]:
+        head += f" · {m['doc_type']}"
     with st.expander(head, expanded=expanded):
-        if detail.doc_type:
+        if m["doc_type"]:
             badge_col, reason_col = st.columns([1, 5])
-            badge_col.badge(detail.doc_type, color=DOC_COLORS.get(detail.doc_type, "gray"))
-            if detail.confidence is not None:
-                reason_col.caption(f"confidence {detail.confidence:.2f} · {detail.decision_reason}")
-        elif detail.decision_reason:
-            st.caption(detail.decision_reason)
+            badge_col.badge(m["doc_type"], color=DOC_COLORS.get(m["doc_type"], "gray"))
+            if m["confidence"] is not None:
+                reason_col.caption(f"confidence {m['confidence']:.2f} · {m['decision_reason']}")
+        elif m["decision_reason"]:
+            st.caption(m["decision_reason"])
 
         for role, label in (("from", "From"), ("to", "To"), ("cc", "Cc"), ("bcc", "Bcc")):
-            people = detail.by_role(role)
-            if people:
-                st.text(f"{label}: " + ", ".join(p.display for p in people))
+            if people[role]:
+                st.text(f"{label}: " + ", ".join(_display(p) for p in people[role]))
 
-        tab_text, tab_files, tab_decision = st.tabs(["Text", f"Attachments ({len(detail.attachments)})", "Decision"])
+        tab_text, tab_files, tab_decision = st.tabs(["Text", f"Attachments ({len(m['attachments'])})", "Decision"])
         with tab_text:
-            st.text(detail.body_text) if detail.body_text.strip() else st.info("This email has no plain-text body.")
+            st.text(m["body_text"]) if m["body_text"].strip() else st.info("This email has no plain-text body.")
         with tab_files:
-            if not files:
+            if not m["attachments"]:
                 st.info("No attachments.")
-            for file in files:
+            for att in m["attachments"]:
                 c1, c2, c3 = st.columns([5, 3, 2])
-                icon = "📄" if file.info.doc_type in ("statement", "invoice", "receipt") else "📎"
-                c1.markdown(f"{icon} **{_escape_md(file.info.filename)}**")
-                if file.info.doc_type:
-                    c1.caption(f"{file.info.doc_type} · confidence {file.info.confidence:.2f}")
-                c2.caption(f"{file.info.content_type} · {_human_size(file.info.size_bytes)}  \nblob_key {file.info.blob_key[:12]}…/{file.info.filename}")
-                if file.content is None:
-                    c3.error(file.error or "unavailable")
-                else:
-                    c3.download_button("Download", data=file.content, file_name=file.info.filename, mime=file.info.content_type, key=f"download-{file.info.id}", width="stretch")
+                icon = "📄" if att["doc_type"] in PAYMENT_TYPES else "📎"
+                c1.markdown(f"{icon} **{_escape_md(att['filename'])}**")
+                if att["doc_type"]:
+                    c1.caption(f"{att['doc_type']} · confidence {att['confidence']:.2f}")
+                c2.caption(f"{att['content_type']} · {_human_size(att['size_bytes'])}  \nblob_key {att['blob_key'][:12]}…")
+                try:
+                    data = api.attachment_bytes(att["id"])
+                    c3.download_button("Download", data=data, file_name=att["filename"], mime=att["content_type"], key=f"download-{att['id']}", width="stretch")
+                except ApiError as exc:
+                    c3.error(str(exc))
         with tab_decision:
-            if decision is None:
+            d = m["decision"]
+            if d is None:
                 st.info("No decision logged.")
             else:
                 st.code(
-                    f"message_id : {decision.message_id}\n"
-                    f"tier       : {decision.tier}  (1 filename, 2 subject, 3 body, 0 none)\n"
-                    f"decision   : {decision.decision}\n"
-                    f"confidence : {decision.confidence if decision.confidence is not None else '-'}\n"
-                    f"reason     : {decision.reason}\n"
-                    f"decided_at : {_fmt_local(decision.decided_at)}\n"
-                    f"in_reply_to: {detail.in_reply_to or '-'}\n"
-                    f"references : {detail.references_header or '-'}",
+                    f"message_id : {d['message_id']}\n"
+                    f"tier       : {d['tier']}  (1 model prediction, 0 nothing classified)\n"
+                    f"decision   : {d['decision']}\n"
+                    f"confidence : {d['confidence'] if d['confidence'] is not None else '-'}\n"
+                    f"reason     : {d['reason']}\n"
+                    f"decided_at : {_fmt(parse_time(d['decided_at']))}\n"
+                    f"in_reply_to: {m['in_reply_to'] or '-'}\n"
+                    f"references : {m['references_header'] or '-'}",
                     language=None,
                 )
 
@@ -253,24 +225,27 @@ def render_message(detail: repo.EmailDetail, files: list[repo.AttachmentFile], d
 # -- helpers -----------------------------------------------------------------------------
 
 
-def _show_sync_result(result: SyncResult) -> None:
-    if result.status == STATUS_OK:
-        st.success(f"Synced in {result.duration_seconds}s: {result.summary()}")
-    elif result.status == STATUS_PARTIAL:
-        st.warning(f"Sync interrupted: {result.summary()}")
+def _show_sync_job(job: dict) -> None:
+    if job["state"] == "failed":
+        st.error(f"Sync crashed: {job['error']}")
+        return
+    result = job["result"]
+    if result is None:
+        return
+    if result["status"] == "ok":
+        st.success(f"Synced in {result['duration_seconds']}s: {result['summary']}")
+    elif result["status"] == "partial":
+        st.warning(f"Sync interrupted: {result['summary']}")
     else:
-        st.error(f"Sync failed: {result.summary()}")
+        st.error(f"Sync failed: {result['summary']}")
 
 
-def _to_local_naive(value: datetime | None) -> datetime | None:
-    if value is None:
-        return None
-    return value.replace(tzinfo=timezone.utc).astimezone().replace(tzinfo=None)
+def _display(p: dict) -> str:
+    return f"{p['name']} <{p['address']}>" if p["name"] else p["address"]
 
 
-def _fmt_local(value: datetime | None) -> str:
-    local = _to_local_naive(value)
-    return local.strftime("%d %b %Y, %H:%M") if local else "unknown"
+def _fmt(value: datetime | None) -> str:
+    return value.strftime("%d %b %Y, %H:%M") if value else "unknown"
 
 
 def _human_size(size: int) -> str:

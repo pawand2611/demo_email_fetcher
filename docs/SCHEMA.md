@@ -67,7 +67,7 @@ erDiagram
     }
     DECISION_LOG {
         text     message_id PK
-        int      tier       "1 filename, 2 subject, 3 body, 0 none"
+        int      tier       "1 model prediction, 0 nothing classified"
         text     decision   "payment | none"
         float    confidence
         text     reason
@@ -104,7 +104,7 @@ The bookmark is read first and moved last.
 | 2 | Fetch UIDs above `last_seen_uid` over IMAP | | |
 | 3 | **Already judged?** If `decision_log` has the Message-ID, skip. A rescan never re-judges. | `decision_log`, `emails` | |
 | 4 | **Find the thread.** A reply into a thread with `has_payment` is kept regardless of its own content. | `threads`, `emails` | |
-| 5 | **Classify** tiers 1 to 3 | | `decision_log` |
+| 5 | **Classify** with the document model | | `decision_log` |
 | 6 | **Keep?** Payment document, or payment thread, or `STORE_ONLY_PAYMENT=false` (the default) → save. Otherwise drop: only the log line is written. | | |
 | 7 | **Save in one transaction**: thread (found or created), email, participants, attachments. Files were written to the store just before. When a thread turns into a payment thread, its earlier mail that was dropped is backfilled from the mailbox by Message-ID. | | `threads`, `emails`, `email_participants`, `attachments`, files |
 | 8 | Move the bookmark | | `sync_state` |
@@ -114,22 +114,24 @@ Streamlit reads `threads`, `emails`, `email_participants`, `attachments` and
 
 ## Classification
 
-`mailbox_viewer/classifier.py` produces one decision per message:
+Classification comes only from a trained document model (LayoutLMv3);
+keyword rules were removed on 2026-10-06. `mailbox_viewer/classifier.py`
+produces one decision per message:
 
-| Tier | Evidence | Confidence |
+| Tier | Meaning | `decision` |
 |---|---|---|
-| 1 | a document attachment's filename contains a payment phrase | 0.95 |
-| 2 | the subject contains a payment phrase | 0.80 |
-| 3 | the first 5000 chars of the body contain a payment phrase | 0.60 |
-| 0 | no phrase, or a phrase but no document attached | none (0.30 for `other`) |
+| 1 | the model labelled at least one PDF or image attachment | `payment` if the strongest label is statement, invoice or receipt and its score is at least `MODEL_MIN_CONFIDENCE`, else `none` |
+| 0 | nothing classified: no model configured, no PDF or image attached, or the model failed on every file | `none` |
 
-A document attachment is a PDF, CSV, XLS or XLSX. Phrase families decide
-`doc_type`: statement (account/bank/card/billing statement, e-statement,
-statement), invoice (invoice, bill, amount due, payment due), receipt
-(payment receipt, payment confirmation, receipt, transaction). Matching is on
-word boundaries after folding `_`, `-` and `.` to spaces, with an optional
-plural. `decision` is `payment` for tiers 1-3, else `none`. A tier-1 match
-flags only the matching files; tiers 2-3 label every attached document.
+Each attachment stores the model's own label and score in
+`attachments.doc_type` / `confidence`; the message takes the strongest one.
+The reason names the model, the file, the label and the score. A model error
+on one file is logged and does not stop the others or the sync.
+
+The model sits behind a two-member interface (`name`, `predict(attachment)`),
+loaded by `mailbox_viewer/document_model.py` from `MODEL_PATH`. Until the
+trained LayoutLMv3 model is added, `MODEL_PATH` is empty and every message is
+tier 0 with "no classification model configured".
 
 ## Attachments
 
@@ -147,3 +149,6 @@ store refuses any key that could escape its root.
   same week after its default telemetry raised an endpoint-security alert.
 - 2026-09-30: six-table model adopted; attachments moved to the local file
   system; categories dropped in favour of `doc_type` / tier / decision log.
+- 2026-10-06: keyword rules removed; classification comes only from the
+  trained document model. The app split into a backend API (FastAPI) and a
+  Streamlit frontend that talks to it over HTTP.

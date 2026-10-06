@@ -1,8 +1,36 @@
-"""Test doubles: an in-memory IMAP "server" and a client that speaks to it."""
+"""Test doubles: an in-memory IMAP "server", a client that speaks to it, and
+a stand-in for the trained document model."""
 
 from __future__ import annotations
 
 from email.message import EmailMessage
+
+from mailbox_viewer.classifier import AttachmentInput, Prediction
+
+
+class FakeDocumentModel:
+    """Predicts from the filename so tests are deterministic: names containing
+    "statement", "invoice" or "receipt" get that label at 0.95, anything else
+    is "other" at 0.60. ``overrides`` and ``fail_on`` target single files."""
+
+    name = "fake"
+
+    def __init__(self) -> None:
+        self.overrides: dict[str, Prediction] = {}
+        self.fail_on: set[str] = set()
+        self.calls: list[str] = []
+
+    def predict(self, attachment: AttachmentInput) -> Prediction | None:
+        self.calls.append(attachment.filename)
+        if attachment.filename in self.fail_on:
+            raise RuntimeError("model could not read the file")
+        if attachment.filename in self.overrides:
+            return self.overrides[attachment.filename]
+        lowered = attachment.filename.lower()
+        for label in ("statement", "invoice", "receipt"):
+            if label in lowered:
+                return Prediction(label, 0.95)
+        return Prediction("other", 0.60)
 
 
 def build_message(

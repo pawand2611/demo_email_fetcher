@@ -37,6 +37,12 @@ class Settings:
     store_only_payment: bool = False
     # Every folder to sync, each with its own bookmark. Defaults to (imap_folder,).
     imap_folders: tuple[str, ...] = ()
+    # Trained document model (LayoutLMv3). Empty = no model; attachments stay unclassified.
+    model_path: str | None = None
+    # A payment label counts only when the model's score reaches this value.
+    model_min_confidence: float = 0.5
+    # Name of the business purpose this deployment serves.
+    profile_name: str = "statement_recon"
 
     def __post_init__(self) -> None:
         if not self.imap_folders:
@@ -53,6 +59,8 @@ _DEFAULTS = {
     "INITIAL_FETCH_LIMIT": "200",
     "ATTACHMENT_DIR": "data/attachments",
     "STORE_ONLY_PAYMENT": "false",
+    "MODEL_MIN_CONFIDENCE": "0.5",
+    "PROFILE_NAME": "statement_recon",
 }
 
 
@@ -93,6 +101,9 @@ def load_settings(env_file: str | os.PathLike[str] | None = None) -> Settings:
         db_schema=db_schema,
         store_only_payment=_get_bool("STORE_ONLY_PAYMENT"),
         imap_folders=folders,
+        model_path=_get("MODEL_PATH") or None,
+        model_min_confidence=_get_fraction("MODEL_MIN_CONFIDENCE"),
+        profile_name=_get("PROFILE_NAME") or "statement_recon",
     )
 
 
@@ -107,6 +118,17 @@ def _get_bool(key: str) -> bool:
     if raw in ("0", "false", "no", "off"):
         return False
     raise ConfigError(f"{key} must be true or false, got {raw!r}")
+
+
+def _get_fraction(key: str) -> float:
+    raw = _get(key)
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ConfigError(f"{key} must be a number between 0 and 1, got {raw!r}") from exc
+    if not 0.0 <= value <= 1.0:
+        raise ConfigError(f"{key} must be between 0 and 1, got {value}")
+    return value
 
 
 def _get_int(key: str) -> int:
