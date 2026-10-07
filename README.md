@@ -163,42 +163,49 @@ Each email is classified by two local models, run as a LangGraph flow
 (`backend/mailbox_viewer/classification_graph.py`):
 
 ```
-START ─┬─> classify_body (Laya, email body) ─────────────────┬─> combine ─> END
-       └─> classify_attachments (LayoutLMv3, each PDF/image) ─┘
+START ─> classify_attachments (LayoutLMv3) ─┬─(attachment decided)──────────────> combine ─> END
+                                            └─(otherwise)─> classify_body (Laya) ─> combine
 ```
 
+- **LayoutLMv3** (trained by the team, invoice vs not invoice) reads the first
+  page of each PDF, JPG, PNG or DOCX attachment.
 - **Laya** (`convaiinnovations/laya`, zero-shot) answers "what kind of
   document does this email send?": invoice, receipt, statement, purchase
   order, quotation or other, with a score.
-- **LayoutLMv3** (trained by the team, invoice vs not invoice) reads the first
-  page of each PDF, JPG, PNG or DOCX attachment.
 
 Decision rule:
 
-| Evidence | Decision |
+| Situation | Decision |
 |---|---|
-| Laya says statement, invoice or receipt with score ≥ `BODY_MIN_CONFIDENCE` (0.7) | payment |
-| An attachment is an invoice with score ≥ 0.6 | payment |
-| Laya says a payment type with score 0.5 to 0.7 | review |
-| An attachment is an invoice with score 0.5 to 0.6 | review |
-| The two models contradict each other on "invoice" | review |
-| Anything else, including low scores on "other" | none |
+| Readable attachment, LayoutLMv3 above `ATTACHMENT_DECIDES_CONFIDENCE` (0.8) says **invoice** | payment, on the attachment alone; Laya not run |
+| Readable attachment, LayoutLMv3 above 0.8 says **not invoice** | not payment, on the attachment alone; Laya not run |
+| Readable attachment, LayoutLMv3 at or below 0.8 | Laya is consulted: statement / invoice / receipt at ≥ `BODY_MIN_CONFIDENCE` (0.7) is payment; 0.5 to 0.7, or a weak invoice call Laya does not support, is review; otherwise none |
+| No readable attachment (none, or only CSV and similar) | Laya alone, same 0.7 bar and review band |
+| An earlier email in the same thread is payment | payment, inherited; no model is run |
+
+Note that a bank statement attached as a PDF is "not invoice" to LayoutLMv3,
+so above 0.8 it is decided as not payment even if Laya reads the body as a
+statement.
 
 Each email's decision, tier (0 nothing classified, 1 attachment model, 2 body
-model, 3 both), score and reason go to `decision_log`; each attachment keeps
+model, 3 both), score and reason go to `decision_log`; inherited emails
+are marked in their reason and have `matched_directly` false; each attachment keeps
 its own label and score.
 
 Both models load only from local folders (`backend/models/`, git-ignored).
 Hugging Face offline mode and telemetry and LangSmith tracing are forced off
 in `mailbox_viewer/__init__.py`. Model inference runs on one dedicated thread
 to keep PyTorch from spawning hundreds of threads. On a laptop CPU, Laya takes
-about 6 seconds per real email.
+about 6 seconds per real email; LayoutLMv3 3 to 9 seconds per attachment.
 
 - **Re-run classifier** (sidebar, `POST /reclassify`, `sync_mail.py --reclassify`):
   runs both models again over all cached mail. Slow: about 25 minutes for 250 emails.
 - **Re-decide** (`POST /redecide`, `sync_mail.py --redecide`): re-applies the
-  decision rule to the stored predictions after changing a threshold. No
-  models, takes about a minute.
+  decision rule and the thread rule to the stored predictions after changing
+  a threshold. No models, takes about a minute.
+- **Attachments only** (`POST /reclassify?only_with_attachments=true`,
+  `sync_mail.py --reclassify --attachments-only`): re-runs only emails with
+  attachments, for example after installing Tesseract.
 
 Model setup, once (weights are not in git):
 
@@ -209,14 +216,16 @@ Model setup, once (weights are not in git):
   `email_utils.py`, `rl_agent_config.json`, `encoder/config.json`,
   `tokenizer/tokenizer.json`, `tokenizer/tokenizer_config.json` from
   huggingface.co/convaiinnovations/laya go to `backend/models/laya/`.
-- Images and scanned PDFs also need the **Tesseract** OCR program, installed
-  through your IT-approved route. Without it they are recorded as "OCR program
-  Tesseract is not installed" and the body model alone decides. DOCX needs
-  LibreOffice.
+- Images and scanned PDFs also need the **Tesseract** OCR program (5.4, with
+  English and French data, as the model was trained with `eng+fra`). The code
+  finds it in `%LOCALAPPDATA%\Programs\Tesseract-OCR` or on `PATH`. Without
+  it they are recorded as "OCR program Tesseract is not installed" and the body
+  model alone decides. DOCX needs LibreOffice, not installed here.
 
 Caution: Laya's 96 to 100% accuracy came from generated emails. On real mail
 it is weaker (for example real invoice replies labelled "purchase order"),
-which the 0.7 bar and the review state compensate for until it is fine-tuned.
+which the 0.7 bar, the review state and the attachment-first rule
+compensate for until it is fine-tuned.
 
 ## Layout
 

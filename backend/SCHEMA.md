@@ -114,13 +114,17 @@ Streamlit reads `threads`, `emails`, `email_participants`, `attachments` and
 
 ## Classification
 
-Two local models, run as a LangGraph flow (`classification_graph.py`): Laya
-(zero-shot) labels the email body, LayoutLMv3 (trained) labels each PDF or
-image attachment invoice / not_invoice. `classifier.combine` applies the
-decision rule; see the README table. In short: Laya counts as payment only at
-a score of 0.7 or more (`BODY_MIN_CONFIDENCE`; 0.9 until 2026-10-07), an invoice attachment from
-0.6; borderline payment evidence and contradictions between the models
-become `review`.
+Two local models, run as a LangGraph flow (`classification_graph.py`).
+LayoutLMv3 (trained) labels each PDF, image or DOCX attachment invoice /
+not_invoice first; above 0.8 (`ATTACHMENT_DECIDES_CONFIDENCE`) it decides the
+email on its own and Laya is skipped. Otherwise Laya (zero-shot) reads the
+body and counts as payment at 0.7 or more (`BODY_MIN_CONFIDENCE`), with 0.5
+to 0.7, or a weak invoice call Laya does not support, going to `review`.
+Without a readable attachment Laya decides alone. Once an email of a thread
+is payment, later emails of that thread inherit it without running the
+models (`matched_directly` false, reason "part of a thread already classified
+as payment"). Re-classify and re-decide replay emails oldest first so the
+thread rule sees earlier emails first. See the README table.
 
 `decision_log.decision` allows `payment`, `none` and `review` (the `review`
 value was added on 2026-10-07; `init_db` upgrades the PostgreSQL check
@@ -152,3 +156,6 @@ store refuses any key that could escape its root.
   the body (zero-shot), LayoutLMv3 on attachments (trained). `review` added
   as a decision. Laya counts as payment only at 0.9 or more.
 - 2026-10-07: payment bar for Laya lowered from 0.9 to 0.7 at the user's request.
+- 2026-10-07: rule set by the user: attachment model decides alone above
+  0.8, otherwise Laya is consulted (0.7 bar); without attachments Laya
+  decides; later emails of a payment thread inherit payment.

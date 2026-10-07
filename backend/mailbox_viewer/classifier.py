@@ -1,4 +1,4 @@
-"""Two-model email classification: the parts and the combine rule.
+"""Two-model email classification: the parts and the decision rule.
 
 * The **attachment model** (LayoutLMv3) labels each PDF, image or DOCX
   attachment ``invoice`` or ``not_invoice`` with a confidence.
@@ -6,29 +6,25 @@
   "what kind of document does this email send?" with one of
   :data:`BODY_LABELS` and a confidence.
 
-:func:`combine` turns both into one :class:`Decision`. The LangGraph flow in
-``classification_graph.py`` runs the two models and then ``combine``.
+Decision rule (the user's, 2026-10-07; scores 0..1):
 
-Combine rule (all scores 0..1):
+1. **The email has an attachment LayoutLMv3 can read.**
+   * LayoutLMv3 above ``ATTACHMENT_DECIDES_CONFIDENCE`` (0.8): decide on the
+     attachment alone. An invoice is payment; confidently not an invoice is
+     not payment. Laya is not run.
+   * Otherwise Laya is consulted as well: a Laya payment label (statement,
+     invoice, receipt) at ``BODY_MIN_CONFIDENCE`` (0.7) or more is payment; a
+     Laya payment label from :data:`BODY_REVIEW_FLOOR` up to that, or a weak
+     invoice call from LayoutLMv3 that Laya does not support, is **review**;
+     anything else is none.
+2. **No readable attachment** (none, or only CSV and similar): Laya alone,
+   same bars.
+3. **Thread rule** (applied by the sync, not here): once an email in a thread
+   is classified payment, later emails in that thread are kept as payment
+   without running the models (:func:`inherited_decision`).
 
-* **Body (Laya)**, bar ``b`` = ``BODY_MIN_CONFIDENCE`` (default 0.7):
-  a payment label (statement, invoice, receipt) scoring >= ``b`` is payment;
-  a payment label scoring from :data:`BODY_REVIEW_FLOOR` up to ``b`` is
-  **review** (worth a human look, not payment); any other label is never
-  payment and never review on its own.
-* **Attachment (LayoutLMv3)**, bar ``t`` = ``MODEL_MIN_CONFIDENCE`` (default
-  0.5): an ``invoice`` scoring >= :data:`ATTACHMENT_DECISIVE` is payment; an
-  ``invoice`` between ``t`` and that is **review** (the binary model is
-  close to a coin flip there).
-* **Review** also when the models contradict each other on "invoice": Laya
-  says invoice (>= ``b``) while an attachment is decisively not an invoice,
-  or an attachment is decisively an invoice while Laya confidently (>= ``b``)
-  says it is not a payment document.
-* Otherwise **payment** if either side says payment, else **none**.
-
-``doc_type`` is ``invoice`` when an attachment confirms it, otherwise the body
-label. ``tier`` records which models contributed: 0 none, 1 attachment model
-only, 2 body model only, 3 both.
+``tier`` records which models decided: 0 none, 1 attachment model only,
+2 body model only, 3 both.
 """
 
 from __future__ import annotations
@@ -69,8 +65,8 @@ PAYMENT_LABELS = frozenset({"statement", "invoice", "receipt"})
 
 # Body model: a payment label below the payment bar but at least this high is sent to review.
 BODY_REVIEW_FLOOR = 0.5
-# Attachment model: binary invoice / not_invoice calls below this score are close to a coin flip.
-ATTACHMENT_DECISIVE = 0.6
+# Attachment model: above this score the attachment decides on its own (default; see settings).
+ATTACHMENT_DECIDES = 0.8
 
 MODEL_CONTENT_TYPES = frozenset(
     {
@@ -183,10 +179,16 @@ class Decision:
     decision: str
     reason: str
     attachments: tuple[AttachmentDecision, ...] = field(default_factory=tuple)
+    inherited: bool = False  # payment because the thread already was; models not run
 
     @property
     def is_payment(self) -> bool:
         return self.decision == DECISION_PAYMENT
+
+    @property
+    def matched_directly(self) -> bool:
+        """Payment on this email's own content, not inherited from its thread."""
+        return self.is_payment and not self.inherited
 
     @property
     def needs_review(self) -> bool:
@@ -259,35 +261,27 @@ def classify_body(subject: str, body: str, model: BodyModel) -> BodyDecision:
 # -- the combine rule -----------------------------------------------------------------------------
 
 
+def attachment_decides(attachments: Sequence[AttachmentDecision], decides_above: float = ATTACHMENT_DECIDES) -> bool:
+    """True when LayoutLMv3 alone settles the email (rule 1, first case):
+    an invoice above the bar, or every readable attachment confidently not an invoice."""
+    scored = [a for a in attachments if a.doc_type is not None and a.confidence is not None]
+    if not scored:
+        return False
+    if any(a.doc_type == ATTACHMENT_INVOICE and a.confidence > decides_above for a in scored):
+        return True
+    return all(a.confidence > decides_above for a in scored)
+
+
 def combine(
     body: BodyDecision,
     attachments: Sequence[AttachmentDecision],
     min_confidence: float = 0.5,
     body_min_confidence: float = 0.7,
+    decides_above: float = ATTACHMENT_DECIDES,
 ) -> Decision:
     scored = [a for a in attachments if a.doc_type is not None and a.confidence is not None]
     has_body = body.label is not None and body.confidence is not None
     attachment_decisions = tuple(attachments)
-
-    if not has_body and not scored:
-        notes = [f"body: {body.note}"] if body.note else []
-        notes += [f'"{a.filename}": {a.note}' for a in attachments if a.note]
-        reason = "; ".join(notes) or "nothing to classify"
-        return Decision(None, TIER_NONE, None, DECISION_NONE, reason, attachment_decisions)
-
-    tier = TIER_BOTH if has_body and scored else (TIER_BODY if has_body else TIER_ATTACHMENT)
-
-    # Attachment model (binary): decisive calls only count as evidence.
-    invoice_bar = max(min_confidence, ATTACHMENT_DECISIVE)
-    invoices = [a for a in scored if a.doc_type == ATTACHMENT_INVOICE and a.confidence >= invoice_bar]
-    borderline_invoices = [a for a in scored if a.doc_type == ATTACHMENT_INVOICE and min_confidence <= a.confidence < invoice_bar]
-    decisive_not_invoice = [a for a in scored if a.doc_type != ATTACHMENT_INVOICE and a.confidence >= ATTACHMENT_DECISIVE]
-
-    # Body model (six options): payment only at or above the body bar.
-    body_is_payment_label = has_body and body.label in PAYMENT_LABELS
-    body_payment = body_is_payment_label and body.confidence >= body_min_confidence
-    body_borderline = body_is_payment_label and BODY_REVIEW_FLOOR <= body.confidence < body_min_confidence
-    body_confident_other = has_body and not body_is_payment_label and body.confidence >= body_min_confidence
 
     parts: list[str] = []
     if has_body:
@@ -296,41 +290,60 @@ def combine(
         parts.append(f"body: {body.note}")
     for a in attachments:
         parts.append(f'"{a.filename}": ' + (f"{a.doc_type} ({a.confidence:.2f})" if a.doc_type else (a.note or "not classified")))
-    summary = "; ".join(parts)
+    summary = "; ".join(parts) or "nothing to classify"
 
-    def review(why: str, doc_type: str | None, confidence: float) -> Decision:
-        return Decision(doc_type, tier, confidence, DECISION_REVIEW, f"{summary} -> review: {why}", attachment_decisions)
+    def decide(decision: str, doc_type: str | None, confidence: float | None, tier: int, why: str) -> Decision:
+        arrow = {DECISION_PAYMENT: "payment", DECISION_REVIEW: "review", DECISION_NONE: "not a payment document"}[decision]
+        return Decision(doc_type, tier, confidence, decision, f"{summary} -> {arrow}: {why}", attachment_decisions)
 
-    # 1. The models contradict each other on "invoice".
-    if body_payment and body.label == ATTACHMENT_INVOICE and not invoices and decisive_not_invoice:
-        return review("models disagree on invoice", ATTACHMENT_INVOICE, body.confidence)
-    if invoices and body_confident_other:
-        return review("models disagree on invoice", ATTACHMENT_INVOICE, max(a.confidence for a in invoices))
+    # Rule 1a: a confident attachment decides on its own.
+    if attachment_decides(attachments, decides_above):
+        strong_invoices = [a for a in scored if a.doc_type == ATTACHMENT_INVOICE and a.confidence > decides_above]
+        if strong_invoices:
+            best = max(strong_invoices, key=lambda a: a.confidence)
+            return decide(DECISION_PAYMENT, ATTACHMENT_INVOICE, best.confidence, TIER_ATTACHMENT,
+                          f"attachment model above {decides_above:.2f}")
+        best = max(scored, key=lambda a: a.confidence)
+        return decide(DECISION_NONE, "other", best.confidence, TIER_ATTACHMENT,
+                      f"attachment model above {decides_above:.2f} says not an invoice")
 
-    # 2. Payment: a confident body payment label, or a decisive invoice attachment.
-    if invoices or body_payment:
-        best_invoice = max(invoices, key=lambda a: a.confidence) if invoices else None
-        doc_type = ATTACHMENT_INVOICE if best_invoice else body.label
-        supporting = []
-        if best_invoice:
-            supporting.append(best_invoice.confidence)
-        if body_payment:
-            supporting.append(body.confidence)
-        return Decision(doc_type, tier, max(supporting), DECISION_PAYMENT, f"{summary} -> payment", attachment_decisions)
+    if not has_body and not scored:
+        return Decision(None, TIER_NONE, None, DECISION_NONE, summary, attachment_decisions)
 
-    # 3. Borderline payment evidence: a human should look.
-    if body_borderline:
-        return review(f"{body.label} below the {body_min_confidence:.2f} payment bar", body.label, body.confidence)
-    if borderline_invoices:
-        best = max(borderline_invoices, key=lambda a: a.confidence)
-        return review("attachment model is unsure about invoice", ATTACHMENT_INVOICE, best.confidence)
+    tier = TIER_BOTH if scored and has_body else (TIER_BODY if has_body else TIER_ATTACHMENT)
+    body_is_payment_label = has_body and body.label in PAYMENT_LABELS
+    weak_invoices = [a for a in scored if a.doc_type == ATTACHMENT_INVOICE and a.confidence >= min_confidence]
+
+    # Rules 1b and 2: Laya decides, with the attachment as supporting evidence.
+    if body_is_payment_label and body.confidence >= body_min_confidence:
+        doc_type = ATTACHMENT_INVOICE if weak_invoices and body.label == ATTACHMENT_INVOICE else body.label
+        return decide(DECISION_PAYMENT, doc_type, body.confidence, tier, f"body model at or above {body_min_confidence:.2f}")
+    if body_is_payment_label and body.confidence >= BODY_REVIEW_FLOOR:
+        return decide(DECISION_REVIEW, body.label, body.confidence, tier,
+                      f"{body.label} below the {body_min_confidence:.2f} payment bar")
+    if weak_invoices:
+        best = max(weak_invoices, key=lambda a: a.confidence)
+        return decide(DECISION_REVIEW, ATTACHMENT_INVOICE, best.confidence, tier,
+                      "attachment model unsure about invoice and body model does not confirm")
 
     if has_body:
-        doc_type, confidence = body.label, body.confidence
-    else:
-        top = max(scored, key=lambda a: a.confidence)
-        doc_type, confidence = ("other" if top.doc_type == ATTACHMENT_NOT_INVOICE else top.doc_type), top.confidence
-    return Decision(doc_type, tier, confidence, DECISION_NONE, f"{'; '.join(parts)} -> not a payment document", attachment_decisions)
+        return decide(DECISION_NONE, body.label, body.confidence, tier, "no payment evidence")
+    best = max(scored, key=lambda a: a.confidence)
+    return decide(DECISION_NONE, "other", best.confidence, tier, "no payment evidence")
+
+
+def inherited_decision(n_attachments: int) -> Decision:
+    """Rule 3: the email belongs to a thread already classified as payment, so
+    it is kept as payment without running either model."""
+    return Decision(
+        None,
+        TIER_NONE,
+        None,
+        DECISION_PAYMENT,
+        "part of a thread already classified as payment; models not run",
+        tuple(AttachmentDecision(None, None) for _ in range(n_attachments)),
+        inherited=True,
+    )
 
 
 _BODY_IN_REASON = re.compile(r"^body: ([a-z_]+) \((\d\.\d\d)\)")

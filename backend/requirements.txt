@@ -1,8 +1,26 @@
+# --- API, database, sync ----------------------------------------------------------
 fastapi>=0.115
 uvicorn>=0.30
 sqlalchemy>=2.0
 psycopg[binary]>=3.1
 python-dotenv>=1.0
 
-# tests (FastAPI's TestClient)
-httpx>=0.27
+# --- classification: LangGraph flow, Laya (body) and LayoutLMv3 (attachments) ---------
+langgraph>=0.2
+torch>=2.2
+transformers>=4.48
+safetensors>=0.4
+numpy>=1.24
+pdfplumber>=0.11
+pytesseract>=0.3.10   # also needs the Tesseract OCR program, installed separately
+Pillow>=10.0
+
+# --- training / evaluation of the attachment model (not needed to run the app) ---------
+datasets>=2.18
+accelerate>=0.28
+scikit-learn>=1.3
+pandas>=2.0
+
+# --- tests -----------------------------------------------------------------------------
+httpx>=0.27   # FastAPI's TestClient
+pytest>=7.0

@@ -192,7 +192,8 @@ class SyncTests(unittest.TestCase):
             self.assertEqual(thread.last_message_at.hour, 11)
             emails = repo.list_thread_emails(session, thread.id)
         self.assertEqual([e.subject for e in emails], ["Re: Re: Invoice #42", "Re: Invoice #42", "Invoice #42"])
-        self.assertEqual([e.matched_directly for e in emails], [True, True, True])
+        self.assertEqual([e.matched_directly for e in emails], [False, False, True])  # replies inherit
+        self.assertEqual([e.decision_reason[:24] for e in emails[:2]], ["part of a thread already"] * 2)
 
     def test_reply_to_uncached_root_joins_a_cached_ancestor(self) -> None:
         # The root itself is older than the sync window; only a later reply is cached.
@@ -219,7 +220,7 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(people, [("from", "statements@acme.example"), ("to", "me@example.com"), ("cc", "partner@example.com")])
         self.assertEqual((email.doc_type, email.confidence, email.matched_directly), ("statement", 0.93, True))
         self.assertEqual(att.blob_key, f"{hashlib.sha256(PDF).hexdigest()}/statement_aug.pdf")
-        self.assertEqual((att.doc_type, att.confidence), ("not_invoice", 0.90))
+        self.assertEqual((att.doc_type, att.confidence), ("not_invoice", 0.70))
         self.assertTrue((self.att_dir / hashlib.sha256(PDF).hexdigest() / "statement_aug.pdf").exists())
         self.assertEqual((log.tier, log.decision, log.confidence), (3, "payment", 0.93))
         self.assertIn("statement_aug.pdf", log.reason)
@@ -240,6 +241,17 @@ class SyncTests(unittest.TestCase):
             files = repo.get_attachment_files(session, email_id, self.store)
         self.assertIsNone(files[0].content)
         self.assertIn("missing", files[0].error)
+
+    def test_reclassify_attachments_only_touches_emails_with_attachments(self) -> None:
+        self.seed_three_messages()
+        self.sync()
+        body_model = self.classifier.body_model
+        body_model.calls.clear()
+
+        with self.factory() as session, session.begin():
+            repo.reclassify_all(session, self.store, self.classifier, only_with_attachments=True)
+
+        self.assertEqual(body_model.calls, ["Your account statement"])  # only the email with a PDF
 
     def test_redecide_applies_a_stricter_body_bar_without_running_models(self) -> None:
         self.seed_three_messages()
@@ -483,16 +495,38 @@ class KeepOnlyPaymentFlowTests(SyncTests):
         self.server.add(1, build_message(subject="Invoice #42", message_id="<root@x>", attachments=[("invoice_42.pdf", "application/pdf", PDF)]))
         self.sync()
         self.server.add(2, build_message(subject="Re: thanks", sender="Ravi <ravi@example.com>", message_id="<reply@x>", in_reply_to="<root@x>", references="<root@x>", text="Thanks, done."))
+        self.classifier.body_model.calls.clear()
+        self.classifier.document_model.calls.clear()
 
         result = self.sync()
 
         self.assertEqual((result.kept, result.payment_hits, result.dropped), (1, 0, 0))
+        self.assertEqual((self.classifier.body_model.calls, self.classifier.document_model.calls), ([], []))  # models not run
         with self.factory() as session:
             thread = repo.list_threads(session)[0]
             self.assertEqual((thread.message_count, thread.has_payment), (2, True))
             log = session.get(DecisionLog, "<reply@x>")
-        self.assertEqual(log.decision, "none")
-        self.assertIn("kept as part of a payment thread", log.reason)
+            reply = session.scalar(select(Email).where(Email.message_id == "<reply@x>"))
+        self.assertEqual((log.decision, reply.matched_directly), ("payment", False))
+        self.assertIn("thread already classified as payment", log.reason)
+
+    def test_replay_applies_the_thread_rule_oldest_first(self) -> None:
+        self.server.add(1, build_message(subject="Plan", message_id="<p0@x>", date="Mon, 01 Sep 2026 09:00:00 +0000"))
+        self.server.add(2, build_message(subject="Re: Plan", message_id="<p1@x>", in_reply_to="<p0@x>", references="<p0@x>",
+                                         date="Mon, 01 Sep 2026 10:00:00 +0000", text="Invoice attached.",
+                                         attachments=[("invoice_9.pdf", "application/pdf", PDF)]))
+        self.server.add(3, build_message(subject="Re: Re: Plan", message_id="<p2@x>", in_reply_to="<p1@x>", references="<p0@x> <p1@x>",
+                                         date="Mon, 01 Sep 2026 11:00:00 +0000"))
+        self.sync()
+        with self.factory() as session:
+            decisions = {log.message_id: log.decision for log in session.scalars(select(DecisionLog))}
+        # earlier email is not payment; the invoice email is; the later reply inherits it
+        self.assertEqual(decisions, {"<p0@x>": "none", "<p1@x>": "payment", "<p2@x>": "payment"})
+
+        with self.factory() as session, session.begin():
+            self.assertEqual(repo.redecide_all(session, self.classifier), 0)  # stored state is already consistent
+        with self.factory() as session, session.begin():
+            self.assertEqual(repo.reclassify_all(session, self.store, self.classifier), 0)
 
     def test_dropped_ancestors_are_backfilled_when_thread_turns_payment(self) -> None:
         self.server.add(1, build_message(subject="Plan", message_id="<root@x>", date="Mon, 01 Sep 2026 09:00:00 +0000"))

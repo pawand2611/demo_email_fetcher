@@ -11,7 +11,8 @@ from mailbox_viewer.classifier import AttachmentInput, Prediction
 class FakeDocumentModel:
     """Stands in for the LayoutLMv3 attachment model. Predicts from the
     filename so tests are deterministic: names containing "invoice" are
-    ``invoice`` at 0.95, anything else ``not_invoice`` at 0.90.
+    ``invoice`` at 0.95 (decisive), anything else ``not_invoice`` at 0.70
+    (below the 0.8 bar, so the body model is consulted too).
     ``overrides`` and ``fail_on`` target single files."""
 
     name = "fake-attachment"
@@ -29,7 +30,7 @@ class FakeDocumentModel:
             return self.overrides[attachment.filename]
         if "invoice" in attachment.filename.lower():
             return Prediction("invoice", 0.95)
-        return Prediction("not_invoice", 0.90)
+        return Prediction("not_invoice", 0.70)
 
 
 class FakeBodyModel:

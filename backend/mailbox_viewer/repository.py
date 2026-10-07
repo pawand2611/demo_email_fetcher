@@ -19,7 +19,14 @@ from sqlalchemy.orm import Session, selectinload
 
 from .attachment_store import AttachmentStoreError, FileSystemStore
 from .classification_graph import EmailClassifier
-from .classifier import AttachmentDecision, AttachmentInput, Decision, EmailInput, body_decision_from_reason
+from .classifier import (
+    AttachmentDecision,
+    AttachmentInput,
+    Decision,
+    EmailInput,
+    body_decision_from_reason,
+    inherited_decision,
+)
 from .mail_parser import ParsedEmail
 from .models import Attachment, DecisionLog, Email, EmailParticipant, SyncState, Thread, to_naive_utc, utcnow_naive
 from .threads import ancestor_ids, conversation_key
@@ -185,7 +192,7 @@ def insert_email(session: Session, mail: ParsedEmail, decision: Decision, blob_k
         body_text=mail.body_text,
         received_at=received,
         has_attachments=mail.has_attachments,
-        matched_directly=decision.is_payment,
+        matched_directly=decision.matched_directly,
         doc_type=decision.doc_type,
         confidence=decision.confidence,
         decision_reason=decision.reason,
@@ -257,69 +264,101 @@ def _log_decision(session: Session, message_id: str, decision: Decision, existin
     log.decided_at = utcnow_naive()
 
 
-def reclassify_all(session: Session, store: FileSystemStore, classifier: EmailClassifier) -> int:
-    """Re-run both models over every cached mail. Subject and body come from the
-    database, attachment bytes from the file store; the mail server is never
-    contacted. Updates emails, attachments, decision_log and thread roll-ups,
-    writing only rows that actually change. Returns how many emails changed."""
-    changed = 0
-    rows = session.scalars(select(Email).options(selectinload(Email.attachments))).all()
-    logs = {log.message_id: log for log in session.scalars(select(DecisionLog))}  # one query, not one per email
-    started = time.monotonic()
-    for done, row in enumerate(rows, start=1):
-        if done % 25 == 0 or done == len(rows):
-            elapsed = time.monotonic() - started
-            logger.info("reclassify: %d/%d emails, %.1fs per email", done, len(rows), elapsed / done)
+def reclassify_all(
+    session: Session, store: FileSystemStore, classifier: EmailClassifier, only_with_attachments: bool = False
+) -> int:
+    """Re-run the classification over cached mail, oldest first, applying the
+    thread rule as it goes. Subject and body come from the database,
+    attachment bytes from the file store; the mail server is never contacted.
+    Writes only rows that change. Returns how many emails changed."""
+
+    def run(row: Email) -> Decision:
         inputs = tuple(
             AttachmentInput(a.filename, a.content_type, store.get(a.blob_key) if store.exists(a.blob_key) else None)
             for a in row.attachments
         )
-        decision = classifier.classify(EmailInput(row.subject, row.body_text, inputs))
-        before = (row.doc_type, row.confidence, row.decision_reason, row.matched_directly)
-        row.doc_type = decision.doc_type
-        row.confidence = decision.confidence
-        row.decision_reason = decision.reason
-        row.matched_directly = decision.is_payment
-        for att, verdict in zip(row.attachments, decision.attachments):
-            att.doc_type = verdict.doc_type
-            att.confidence = verdict.confidence
-        _log_decision(session, row.message_id, decision, existing=logs.get(row.message_id))
-        if before != (row.doc_type, row.confidence, row.decision_reason, row.matched_directly):
-            changed += 1
-    session.flush()
-    _recompute_thread_flags(session)
-    return changed
+        return classifier.classify(EmailInput(row.subject, row.body_text, inputs))
+
+    where = Email.has_attachments.is_(True) if only_with_attachments else None  # e.g. after installing OCR
+    return _replay(session, run, where, progress_label="reclassify")
 
 
 def redecide_all(session: Session, classifier: EmailClassifier) -> int:
-    """Re-apply the decision rule to the predictions already stored, without
-    running the models: Laya's label and score come from the stored reason,
-    LayoutLMv3's from the attachments table. Takes seconds, not minutes.
-    Returns how many emails changed."""
-    changed = 0
-    rows = session.scalars(select(Email).options(selectinload(Email.attachments))).all()
-    logs = {log.message_id: log for log in session.scalars(select(DecisionLog))}
-    for row in rows:
-        log = logs.get(row.message_id)
-        reason = log.reason if log else row.decision_reason
-        stored_reason = (reason or "").split("; kept as part of")[0].split("; backfilled into")[0]
-        body = body_decision_from_reason(stored_reason)
+    """Re-apply the decision rule and thread rule to the predictions already
+    stored, without running the models: Laya's label and score come from the
+    stored reason, LayoutLMv3's from the attachments table. Returns how many
+    emails changed. Emails whose models were never run (they had inherited a
+    thread's payment status) need a full re-classify if they stop inheriting."""
+
+    def run(row: Email, log: DecisionLog | None = None) -> Decision:
+        reason = (log.reason if log else row.decision_reason) or ""
+        body = body_decision_from_reason(reason)
         attachments = tuple(
-            AttachmentDecision(a.doc_type, a.confidence, a.filename, None if a.doc_type else _note_for(stored_reason, a.filename))
+            AttachmentDecision(a.doc_type, a.confidence, a.filename, None if a.doc_type else _note_for(reason, a.filename))
             for a in row.attachments
         )
-        decision = classifier.combine(body, attachments)
+        return classifier.combine(body, attachments)
+
+    return _replay(session, run, None, progress_label=None, run_gets_log=True)
+
+
+def _replay(session: Session, run, where, progress_label: str | None, run_gets_log: bool = False) -> int:
+    """Decide emails oldest first so the thread rule sees earlier emails first."""
+    stmt = select(Email).options(selectinload(Email.attachments))
+    if where is not None:
+        stmt = stmt.where(where)
+    rows = sorted(session.scalars(stmt).all(), key=_order_key)
+    logs = {log.message_id: log for log in session.scalars(select(DecisionLog))}  # one query, not one per email
+
+    # Earliest direct payment match per thread among emails NOT replayed now.
+    replayed_ids = {row.id for row in rows}
+    outside_first: dict[int, tuple] = {}
+    for other in session.scalars(select(Email).where(Email.matched_directly.is_(True))):
+        if other.id not in replayed_ids:
+            key = _order_key(other)
+            if other.thread_id not in outside_first or key < outside_first[other.thread_id]:
+                outside_first[other.thread_id] = key
+    inside_first: dict[int, tuple] = {}
+
+    changed = 0
+    started = time.monotonic()
+    for done, row in enumerate(rows, start=1):
+        if progress_label and (done % 25 == 0 or done == len(rows)):
+            logger.info("%s: %d/%d emails, %.1fs per email", progress_label, done, len(rows), (time.monotonic() - started) / done)
+        key = _order_key(row)
+        first = min((k for k in (inside_first.get(row.thread_id), outside_first.get(row.thread_id)) if k is not None), default=None)
+        log = logs.get(row.message_id)
+        if first is not None and first < key:
+            decision = inherited_decision(len(row.attachments))
+        else:
+            decision = run(row, log) if run_gets_log else run(row)
+            if log and log.reason and _BACKFILL_NOTE in log.reason and not decision.is_payment:
+                decision = decision.with_note(_BACKFILL_NOTE)  # keep the sync's record of why it was stored
+        if decision.matched_directly and row.thread_id not in inside_first:
+            inside_first[row.thread_id] = key
+
         before = (row.doc_type, row.confidence, row.decision_reason, row.matched_directly)
         row.doc_type = decision.doc_type
         row.confidence = decision.confidence
         row.decision_reason = decision.reason
-        row.matched_directly = decision.is_payment
+        row.matched_directly = decision.matched_directly
+        if not run_gets_log or decision.inherited:
+            for att, verdict in zip(row.attachments, decision.attachments):
+                att.doc_type = verdict.doc_type
+                att.confidence = verdict.confidence
         _log_decision(session, row.message_id, decision, existing=log)
         if before != (row.doc_type, row.confidence, row.decision_reason, row.matched_directly):
             changed += 1
     session.flush()
     _recompute_thread_flags(session)
     return changed
+
+
+_BACKFILL_NOTE = "backfilled into a payment thread"
+
+
+def _order_key(row: Email) -> tuple:
+    return (row.received_at or datetime.min, row.id)
 
 
 def _note_for(reason: str, filename: str) -> str | None:

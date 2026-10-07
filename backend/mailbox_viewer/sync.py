@@ -29,7 +29,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from . import repository as repo
 from .attachment_store import AttachmentStoreError, FileSystemStore, build_store
 from .classification_graph import EmailClassifier
-from .classifier import Decision, EmailInput
+from .classifier import Decision, EmailInput, inherited_decision
 from .config import Settings
 from .document_model import load_classifier
 from .mail_client import MailClient, MailClientError, MailConnectionLost
@@ -257,10 +257,9 @@ class _Processor:
             thread_id = repo.find_thread_id(session, mail)
             in_payment_thread = thread_id is not None and repo.thread_has_payment(session, thread_id)
 
-        # Step 4: classify with both models; every message gets a decision line.
-        decision = self._classify(mail)
-        if in_payment_thread and not decision.is_payment:
-            decision = decision.with_note("kept as part of a payment thread")
+        # Step 4: classify; every message gets a decision line. A later email of a
+        # thread already classified as payment inherits it without running the models.
+        decision = inherited_decision(len(mail.attachments)) if in_payment_thread else self._classify(mail)
 
         # Step 5: keep?
         keep = decision.is_payment or in_payment_thread or not self.store_only_payment
@@ -270,9 +269,9 @@ class _Processor:
             return "dropped"
 
         self._store(mail, decision)
-        if decision.is_payment and self.store_only_payment:
+        if decision.matched_directly and self.store_only_payment:
             self._backfill_ancestors(mail)
-        return "payment" if decision.is_payment else "kept"
+        return "payment" if decision.matched_directly else "kept"
 
     def _store(self, mail: ParsedEmail, decision: Decision) -> None:
         # Files go to the store first, between transactions, so a slow disk

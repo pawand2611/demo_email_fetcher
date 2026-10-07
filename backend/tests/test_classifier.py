@@ -22,8 +22,10 @@ from mailbox_viewer.classifier import (
     Prediction,
     classify_attachments,
     classify_body,
+    attachment_decides,
     body_decision_from_reason,
     combine,
+    inherited_decision,
     is_model_input,
     model_content_type,
 )
@@ -53,7 +55,7 @@ class AttachmentStepTests(unittest.TestCase):
             model,
         )
         self.assertEqual([(a.doc_type, a.confidence) for a in out],
-                         [("invoice", 0.95), ("not_invoice", 0.90), (None, None), (None, None), (None, None)])
+                         [("invoice", 0.95), ("not_invoice", 0.70), (None, None), (None, None), (None, None)])
         self.assertEqual([a.note for a in out[2:]], ["not a PDF, image or DOCX", "file bytes unavailable",
                                                        "RuntimeError: model could not read the file"])
 
@@ -98,38 +100,50 @@ class BodyStepTests(unittest.TestCase):
 
 
 class CombineRuleTests(unittest.TestCase):
-    def test_both_agree_on_invoice(self) -> None:
-        d = combine(body("invoice", 0.92), [att("invoice", 0.95, "inv.pdf")])
-        self.assertEqual((d.decision, d.doc_type, d.tier, d.confidence), (DECISION_PAYMENT, "invoice", TIER_BOTH, 0.95))
-        self.assertIn('body: invoice (0.92); "inv.pdf": invoice (0.95) -> payment', d.reason)
+    # Rule 1a: attachment above 0.8 decides alone.
+    def test_confident_invoice_attachment_decides_alone(self) -> None:
+        d = combine(body("other", 0.95), [att("invoice", 0.95, "inv.jpg")])
+        self.assertEqual((d.decision, d.doc_type, d.tier, d.confidence), (DECISION_PAYMENT, "invoice", TIER_ATTACHMENT, 0.95))
+        self.assertIn("payment: attachment model above 0.80", d.reason)
 
-    def test_body_statement_with_non_invoice_attachment_is_payment_not_conflict(self) -> None:
-        d = combine(body("statement", 0.93), [att("not_invoice", 0.90)])
-        self.assertEqual((d.decision, d.doc_type, d.confidence), (DECISION_PAYMENT, "statement", 0.93))
+    def test_confident_non_invoice_attachment_decides_alone_even_if_body_says_statement(self) -> None:
+        d = combine(body("statement", 0.97), [att("not_invoice", 1.0, "statement.pdf")])
+        self.assertEqual((d.decision, d.doc_type, d.tier), (DECISION_NONE, "other", TIER_ATTACHMENT))
+        self.assertIn("attachment model above 0.80 says not an invoice", d.reason)
 
-    def test_attachment_invoice_alone_is_payment(self) -> None:
-        d = combine(body(None, None, "no body model configured"), [att("invoice", 0.88)])
-        self.assertEqual((d.decision, d.doc_type, d.tier), (DECISION_PAYMENT, "invoice", TIER_ATTACHMENT))
+    def test_any_confident_invoice_among_several_attachments_decides(self) -> None:
+        d = combine(body(None), [att("not_invoice", 0.6, "a.pdf"), att("invoice", 0.9, "b.pdf")])
+        self.assertEqual(d.decision, DECISION_PAYMENT)
 
+    def test_exactly_at_the_bar_is_not_above_it(self) -> None:
+        self.assertFalse(attachment_decides([att("invoice", 0.8)]))
+        self.assertTrue(attachment_decides([att("invoice", 0.81)]))
+
+    # Rule 1b: attachment at or below 0.8, Laya consulted.
+    def test_weak_attachment_and_confident_body_payment_is_payment(self) -> None:
+        d = combine(body("statement", 0.93), [att("not_invoice", 0.7)])
+        self.assertEqual((d.decision, d.doc_type, d.tier, d.confidence), (DECISION_PAYMENT, "statement", TIER_BOTH, 0.93))
+
+    def test_weak_invoice_attachment_and_body_invoice_is_payment(self) -> None:
+        d = combine(body("invoice", 0.9), [att("invoice", 0.7)])
+        self.assertEqual((d.decision, d.doc_type), (DECISION_PAYMENT, "invoice"))
+
+    def test_weak_invoice_attachment_without_body_support_is_review(self) -> None:
+        d = combine(body("other", 0.9), [att("invoice", 0.7)])
+        self.assertEqual((d.decision, d.doc_type), (DECISION_REVIEW, "invoice"))
+        self.assertIn("attachment model unsure about invoice", d.reason)
+
+    def test_weak_non_invoice_attachment_and_body_other_is_none(self) -> None:
+        self.assertEqual(combine(body("other", 0.9), [att("not_invoice", 0.7)]).decision, DECISION_NONE)
+
+    # Rule 2: no readable attachment, Laya alone.
     def test_body_payment_without_attachments(self) -> None:
         d = combine(body("receipt", 0.91), [])
         self.assertEqual((d.decision, d.doc_type, d.tier), (DECISION_PAYMENT, "receipt", TIER_BODY))
 
-    def test_body_says_invoice_attachment_says_not_is_review(self) -> None:
-        d = combine(body("invoice", 0.92), [att("not_invoice", 0.90)])
-        self.assertEqual((d.decision, d.doc_type), (DECISION_REVIEW, "invoice"))
-        self.assertIn("models disagree on invoice", d.reason)
-        self.assertTrue(d.needs_review)
-        self.assertFalse(d.is_payment)
-
-    def test_attachment_invoice_but_body_confidently_says_other_is_review(self) -> None:
-        d = combine(body("purchase_order", 0.95), [att("invoice", 0.95)])
-        self.assertEqual((d.decision, d.doc_type), (DECISION_REVIEW, "invoice"))
-        self.assertIn("models disagree on invoice", d.reason)
-
-    def test_attachment_invoice_with_unsure_body_other_is_payment(self) -> None:
-        d = combine(body("other", 0.55), [att("invoice", 0.95)])
-        self.assertEqual((d.decision, d.doc_type), (DECISION_PAYMENT, "invoice"))
+    def test_unreadable_attachment_counts_as_no_attachment(self) -> None:
+        d = combine(body("invoice", 0.92), [att(None, None, "rows.csv", "not a PDF, image or DOCX")])
+        self.assertEqual((d.decision, d.tier), (DECISION_PAYMENT, TIER_BODY))
 
     def test_payment_label_below_body_bar_is_review_not_payment(self) -> None:
         d = combine(body("receipt", 0.65), [])
@@ -145,40 +159,33 @@ class CombineRuleTests(unittest.TestCase):
             with self.subTest(label=label):
                 self.assertEqual(combine(body(label, 0.45), []).decision, DECISION_NONE)
 
-    def test_borderline_invoice_attachment_is_review(self) -> None:
-        d = combine(body(None, None, "empty email body"), [att("invoice", 0.55)])
-        self.assertEqual((d.decision, d.doc_type), (DECISION_REVIEW, "invoice"))
-        self.assertIn("attachment model is unsure about invoice", d.reason)
-
-    def test_unsure_invoice_body_with_decisive_non_invoice_attachment_is_review(self) -> None:
-        d = combine(body("invoice", 0.55), [att("not_invoice", 0.90)])
-        self.assertEqual(d.decision, DECISION_REVIEW)
-        self.assertIn("invoice below the 0.70 payment bar", d.reason)
-
     def test_plain_mail(self) -> None:
         d = combine(body("other", 0.80), [])
         self.assertEqual((d.decision, d.doc_type, d.tier), (DECISION_NONE, "other", TIER_BODY))
-
-    def test_attachment_only_not_invoice_maps_to_other(self) -> None:
-        d = combine(body(None, None, "empty email body"), [att("not_invoice", 0.9)])
-        self.assertEqual((d.decision, d.doc_type), (DECISION_NONE, "other"))
 
     def test_nothing_classified(self) -> None:
         d = combine(body(None, None, "no body model configured"), [att(None, None, "scan.jpg", "OCR program Tesseract is not installed")])
         self.assertEqual((d.decision, d.tier, d.doc_type, d.confidence), (DECISION_NONE, TIER_NONE, None, None))
         self.assertEqual(d.reason, 'body: no body model configured; "scan.jpg": OCR program Tesseract is not installed')
 
-    def test_body_bar_is_configurable(self) -> None:
+    # Settings.
+    def test_bars_are_configurable(self) -> None:
         self.assertEqual(combine(body("invoice", 0.92), [], body_min_confidence=0.95).decision, DECISION_REVIEW)
         self.assertEqual(combine(body("invoice", 0.96), [], body_min_confidence=0.95).decision, DECISION_PAYMENT)
-        self.assertEqual(combine(body("invoice", 0.92), []).decision, DECISION_PAYMENT)  # default bar 0.70
+        self.assertEqual(combine(body(None), [att("invoice", 0.85)], decides_above=0.9).decision, DECISION_REVIEW)
+        self.assertEqual(combine(body(None), [att("invoice", 0.85)]).decision, DECISION_PAYMENT)  # default bar 0.80
 
-    def test_attachment_bar_is_configurable(self) -> None:
-        self.assertEqual(combine(body(None, None), [att("invoice", 0.75)], min_confidence=0.8).decision, DECISION_NONE)
+    # Rule 3 output.
+    def test_inherited_decision(self) -> None:
+        d = inherited_decision(2)
+        self.assertTrue(d.is_payment and d.inherited)
+        self.assertFalse(d.matched_directly)
+        self.assertEqual(len(d.attachments), 2)
+        self.assertIn("thread already classified as payment", d.reason)
 
     def test_with_note(self) -> None:
-        d = combine(body("other", 0.8), []).with_note("kept as part of a payment thread")
-        self.assertTrue(d.reason.endswith("; kept as part of a payment thread"))
+        d = combine(body("other", 0.8), []).with_note("backfilled into a payment thread")
+        self.assertTrue(d.reason.endswith("; backfilled into a payment thread"))
 
 
 class StoredPredictionTests(unittest.TestCase):
@@ -192,8 +199,8 @@ class StoredPredictionTests(unittest.TestCase):
         self.assertEqual(body_decision_from_reason(None).note, "no stored body prediction")
 
     def test_redecide_gives_the_same_answer_as_a_fresh_run(self) -> None:
-        cases = [(body("receipt", 0.75), []), (body("invoice", 0.92), [att("not_invoice", 0.9, "x.pdf")]),
-                 (body("other", 0.45), [att("invoice", 0.95, "inv.pdf")])]
+        cases = [(body("receipt", 0.65), []), (body("invoice", 0.92), [att("not_invoice", 0.7, "x.pdf")]),
+                 (body("other", 0.45), [att("invoice", 0.7, "inv.pdf")])]
         for b, atts in cases:
             with self.subTest(body=b):
                 first = combine(b, atts)
@@ -202,16 +209,29 @@ class StoredPredictionTests(unittest.TestCase):
 
 
 class GraphTests(unittest.TestCase):
-    def test_graph_runs_both_models_and_combines(self) -> None:
+    def test_confident_attachment_skips_the_body_model(self) -> None:
         body_model, doc_model = FakeBodyModel(), FakeDocumentModel()
         clf = fake_classifier(body_model, doc_model)
 
         d = clf.classify(EmailInput("Invoice #42", "Please pay.", (pdf("invoice_42.pdf"), pdf("terms.pdf"))))
 
-        self.assertEqual((d.decision, d.doc_type, d.tier), (DECISION_PAYMENT, "invoice", TIER_BOTH))
+        self.assertEqual((d.decision, d.doc_type, d.tier), (DECISION_PAYMENT, "invoice", TIER_ATTACHMENT))
         self.assertEqual([a.doc_type for a in d.attachments], ["invoice", "not_invoice"])
-        self.assertEqual(body_model.calls, ["Invoice #42"])
         self.assertEqual(doc_model.calls, ["invoice_42.pdf", "terms.pdf"])
+        self.assertEqual(body_model.calls, [])  # Laya not run
+        self.assertIn("body: not run: attachment model decided", d.reason)
+
+    def test_unsure_attachment_consults_the_body_model(self) -> None:
+        body_model, doc_model = FakeBodyModel(), FakeDocumentModel()
+        d = fake_classifier(body_model, doc_model).classify(EmailInput("Your account statement", "attached", (pdf("sep.pdf"),)))
+        self.assertEqual((d.decision, d.doc_type, d.tier), (DECISION_PAYMENT, "statement", TIER_BOTH))
+        self.assertEqual(body_model.calls, ["Your account statement"])
+
+    def test_no_attachment_uses_the_body_model_only(self) -> None:
+        body_model, doc_model = FakeBodyModel(), FakeDocumentModel()
+        d = fake_classifier(body_model, doc_model).classify(EmailInput("Lunch?", "1pm?", ()))
+        self.assertEqual((d.decision, d.tier), (DECISION_NONE, TIER_BODY))
+        self.assertEqual(doc_model.calls, [])
 
     def test_graph_with_no_models(self) -> None:
         clf = EmailClassifier(NoBodyModel(), NoModel())
@@ -222,8 +242,8 @@ class GraphTests(unittest.TestCase):
 
     def test_graph_shape(self) -> None:
         diagram = fake_classifier().mermaid()
-        for node in ("classify_body", "classify_attachments", "combine"):
-            self.assertIn(node, diagram)
+        for text in ("classify_body", "classify_attachments", "combine", "attachment decided", "consult body"):
+            self.assertIn(text, diagram)
 
     def test_override_prediction(self) -> None:
         body_model = FakeBodyModel()

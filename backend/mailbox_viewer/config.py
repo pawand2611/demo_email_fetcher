@@ -44,6 +44,8 @@ class Settings:
     model_min_confidence: float = 0.5
     # Body model (Laya): a statement / invoice / receipt counts as payment only from this score.
     body_min_confidence: float = 0.7
+    # Attachment model: above this score the attachment decides on its own and Laya is not run.
+    attachment_decides_confidence: float = 0.8
     # Name of the business purpose this deployment serves.
     profile_name: str = "statement_recon"
 
@@ -64,6 +66,7 @@ _DEFAULTS = {
     "STORE_ONLY_PAYMENT": "false",
     "MODEL_MIN_CONFIDENCE": "0.5",
     "BODY_MIN_CONFIDENCE": "0.7",
+    "ATTACHMENT_DECIDES_CONFIDENCE": "0.8",
     "ATTACHMENT_MODEL_DIR": "models/layoutlmv3_invoice",
     "BODY_MODEL_DIR": "models/laya",
     "PROFILE_NAME": "statement_recon",
@@ -111,6 +114,7 @@ def load_settings(env_file: str | os.PathLike[str] | None = None) -> Settings:
         body_model_dir=_get("BODY_MODEL_DIR") or None,
         model_min_confidence=_get_fraction("MODEL_MIN_CONFIDENCE"),
         body_min_confidence=_get_fraction("BODY_MIN_CONFIDENCE"),
+        attachment_decides_confidence=_get_fraction("ATTACHMENT_DECIDES_CONFIDENCE"),
         profile_name=_get("PROFILE_NAME") or "statement_recon",
     )
 

@@ -15,6 +15,8 @@ from mailbox_viewer.attachment_store import FileSystemStore
 from mailbox_viewer.config import Settings
 from mailbox_viewer.db import init_db, make_engine, make_session_factory
 
+from mailbox_viewer.classifier import Prediction
+
 from .fakes import FakeBodyModel, FakeDocumentModel, FakeMailClient, FakeMailServer, build_message, fake_classifier
 
 PDF = b"%PDF-1.4 pretend invoice"
@@ -89,7 +91,7 @@ class ApiTests(unittest.TestCase):
         job = self.run_sync()
 
         self.assertEqual(job["state"], "succeeded")
-        self.assertEqual((job["result"]["status"], job["result"]["kept"], job["result"]["payment_hits"]), ("ok", 3, 2))  # root and reply both mention the invoice
+        self.assertEqual((job["result"]["status"], job["result"]["kept"], job["result"]["payment_hits"]), ("ok", 3, 1))  # the reply inherits the thread's payment status
         self.assertEqual(job["result"]["folders"][0]["last_seen_uid"], 3)
         self.assertTrue(job["finished_at"].endswith("Z") or "+00:00" in job["finished_at"])
 
@@ -119,7 +121,7 @@ class ApiTests(unittest.TestCase):
         self.assertIn("invoice_aug.pdf", download.headers["content-disposition"])
 
         decision = self.client.get("/decisions/<root@x>").json()
-        self.assertEqual((decision["tier"], decision["decision"]), (3, "payment"))
+        self.assertEqual((decision["tier"], decision["decision"]), (1, "payment"))  # decided by the invoice attachment alone
 
     def test_second_sync_is_idempotent_and_stats_add_up(self) -> None:
         self.seed()
@@ -130,7 +132,7 @@ class ApiTests(unittest.TestCase):
         stats = self.client.get("/stats").json()
         self.assertEqual((stats["threads"], stats["emails"], stats["attachments"], stats["payment_threads"]), (2, 3, 1, 1))
         self.assertEqual((stats["judged"], stats["dropped"]), (3, 0))
-        self.assertEqual(stats["by_decision"], {"payment": 2, "none": 1})  # root and reply both mention the invoice
+        self.assertEqual(stats["by_decision"], {"payment": 2, "none": 1})  # root, and the reply by inheritance
         self.assertEqual(stats["needs_review"], 0)
         self.assertEqual(stats["sync_states"][0]["last_seen_uid"], 3)
 
@@ -153,12 +155,13 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(out["state"], "succeeded")
         self.assertEqual(out["result"], {"changed": 0, "model": "body: fake-body, attachments: fake-attachment"})
         self.assertEqual(self.model.calls, ["invoice_aug.pdf"])  # attachment bytes re-read from the store
-        self.assertEqual(sorted(self.body_model.calls), ["Invoice #42", "Lunch?", "Re: Invoice #42"])
+        self.assertEqual(self.body_model.calls, ["Lunch?"])  # root decided by its attachment, reply inherited
         self.assertEqual(self.client.get("/stats").json()["payment_threads"], 1)
 
-    def test_disagreement_is_stored_as_review(self) -> None:
-        self.server.add(1, build_message(subject="Invoice for March", message_id="<rv@x>",
-                                         attachments=[("delivery_note.pdf", "application/pdf", PDF)]))
+    def test_unsure_invoice_attachment_without_body_support_is_review(self) -> None:
+        self.model.overrides["scan.pdf"] = Prediction("invoice", 0.7)
+        self.server.add(1, build_message(subject="Documents", text="See attached.", message_id="<rv@x>",
+                                         attachments=[("scan.pdf", "application/pdf", PDF)]))
         self.run_sync()
         stats = self.client.get("/stats").json()
         self.assertEqual((stats["needs_review"], stats["payment_threads"]), (1, 0))

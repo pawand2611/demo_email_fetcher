@@ -24,6 +24,7 @@ class ProfileOut(BaseModel):
     model: str
     model_min_confidence: float
     body_min_confidence: float
+    attachment_decides_confidence: float
     payment_labels: list[str]
     attachment_store: str
 

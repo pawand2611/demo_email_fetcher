@@ -47,7 +47,8 @@ def main(argv: list[str] | None = None) -> int:
         from mailbox_viewer.classification_graph import EmailClassifier
         from mailbox_viewer.classifier import NoBodyModel, NoModel
 
-        classifier = EmailClassifier(NoBodyModel(), NoModel(), settings.model_min_confidence, settings.body_min_confidence)
+        classifier = EmailClassifier(NoBodyModel(), NoModel(), settings.model_min_confidence, settings.body_min_confidence,
+                                     settings.attachment_decides_confidence)
     else:
         classifier = load_classifier(settings)
     store = build_store(settings)
@@ -73,7 +74,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.reclassify:
         with session_factory() as session, session.begin():
-            changed = repo.reclassify_all(session, store, classifier)
+            changed = repo.reclassify_all(session, store, classifier, args.attachments_only)
             by_doc = repo.count_by_doc_type(session)
             by_decision = repo.count_by_decision(session)
         print(f"Models ({classifier.name}) re-applied to cached mail: {changed} email(s) changed")
@@ -140,6 +141,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--reset-state", action="store_true", help="clear the stored resume point so the run re-walks the folder")
     parser.add_argument("--redecide", action="store_true", help="re-apply the decision rule to stored predictions; no models, no mail server")
+    parser.add_argument("--attachments-only", action="store_true", help="with --reclassify: only emails that have attachments")
     parser.add_argument("--reclassify", action="store_true", help="re-run both models over the cache and exit; does not contact the server")
     return parser.parse_args(argv)
 

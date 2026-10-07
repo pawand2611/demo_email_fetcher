@@ -92,6 +92,7 @@ def load_classifier(settings: Settings) -> EmailClassifier:
         document_model=_load_document_model(settings),
         min_confidence=settings.model_min_confidence,
         body_min_confidence=settings.body_min_confidence,
+        decides_above=settings.attachment_decides_confidence,
     )
 
 

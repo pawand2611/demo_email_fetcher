@@ -78,9 +78,9 @@ def create_app(services: Services | None = None) -> FastAPI:
     def run_sync_job() -> SyncResult:
         return run_sync(svc.settings, svc.session_factory, svc.client_factory, store=svc.store, classifier=svc.classifier)
 
-    def run_reclassify_job() -> dict:
+    def run_reclassify_job(only_with_attachments: bool = False) -> dict:
         with svc.session_factory() as session, session.begin():
-            changed = repo.reclassify_all(session, svc.store, svc.classifier)
+            changed = repo.reclassify_all(session, svc.store, svc.classifier, only_with_attachments)
         return s.ReclassifyOut(changed=changed, model=svc.classifier.name).model_dump()
 
     def run_redecide_job() -> dict:
@@ -127,6 +127,7 @@ def create_app(services: Services | None = None) -> FastAPI:
                 model=svc.classifier.name,
                 model_min_confidence=st_.model_min_confidence,
                 body_min_confidence=st_.body_min_confidence,
+                attachment_decides_confidence=st_.attachment_decides_confidence,
                 payment_labels=sorted(PAYMENT_LABELS),
                 attachment_store=svc.store.describe(),
             )
@@ -167,9 +168,9 @@ def create_app(services: Services | None = None) -> FastAPI:
         return start_job(KIND_SYNC, run_sync_job)
 
     @app.post("/reclassify", response_model=s.JobOut, status_code=202, tags=["jobs"])
-    def reclassify() -> s.JobOut:
+    def reclassify(only_with_attachments: bool = False) -> s.JobOut:
         """Re-run both models over every cached email in the background. No mail-server contact."""
-        return start_job(KIND_RECLASSIFY, run_reclassify_job)
+        return start_job(KIND_RECLASSIFY, lambda: run_reclassify_job(only_with_attachments))
 
     @app.post("/redecide", response_model=s.JobOut, status_code=202, tags=["jobs"])
     def redecide() -> s.JobOut:
