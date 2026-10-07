@@ -177,9 +177,9 @@ Decision rule:
 
 | Evidence | Decision |
 |---|---|
-| Laya says statement, invoice or receipt with score ≥ `BODY_MIN_CONFIDENCE` (0.9) | payment |
+| Laya says statement, invoice or receipt with score ≥ `BODY_MIN_CONFIDENCE` (0.7) | payment |
 | An attachment is an invoice with score ≥ 0.6 | payment |
-| Laya says a payment type with score 0.5 to 0.9 | review |
+| Laya says a payment type with score 0.5 to 0.7 | review |
 | An attachment is an invoice with score 0.5 to 0.6 | review |
 | The two models contradict each other on "invoice" | review |
 | Anything else, including low scores on "other" | none |
@@ -216,7 +216,7 @@ Model setup, once (weights are not in git):
 
 Caution: Laya's 96 to 100% accuracy came from generated emails. On real mail
 it is weaker (for example real invoice replies labelled "purchase order"),
-which the 0.9 bar and the review state compensate for until it is fine-tuned.
+which the 0.7 bar and the review state compensate for until it is fine-tuned.
 
 ## Layout
 

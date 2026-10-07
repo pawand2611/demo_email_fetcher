@@ -68,7 +68,7 @@ class ConfigTests(unittest.TestCase):
     def test_model_settings(self) -> None:
         defaults = load()
         self.assertEqual((defaults.attachment_model_dir, defaults.body_model_dir), ("models/layoutlmv3_invoice", "models/laya"))
-        self.assertEqual((defaults.model_min_confidence, defaults.body_min_confidence, defaults.profile_name), (0.5, 0.9, "statement_recon"))
+        self.assertEqual((defaults.model_min_confidence, defaults.body_min_confidence, defaults.profile_name), (0.5, 0.7, "statement_recon"))
         self.assertEqual(load(BODY_MIN_CONFIDENCE="0.95").body_min_confidence, 0.95)
 
         custom = load(ATTACHMENT_MODEL_DIR="D:/m/lv3", BODY_MODEL_DIR="D:/m/laya", MODEL_MIN_CONFIDENCE="0.8", PROFILE_NAME="hr_intake")

@@ -11,7 +11,7 @@
 
 Combine rule (all scores 0..1):
 
-* **Body (Laya)**, bar ``b`` = ``BODY_MIN_CONFIDENCE`` (default 0.9):
+* **Body (Laya)**, bar ``b`` = ``BODY_MIN_CONFIDENCE`` (default 0.7):
   a payment label (statement, invoice, receipt) scoring >= ``b`` is payment;
   a payment label scoring from :data:`BODY_REVIEW_FLOOR` up to ``b`` is
   **review** (worth a human look, not payment); any other label is never
@@ -263,7 +263,7 @@ def combine(
     body: BodyDecision,
     attachments: Sequence[AttachmentDecision],
     min_confidence: float = 0.5,
-    body_min_confidence: float = 0.9,
+    body_min_confidence: float = 0.7,
 ) -> Decision:
     scored = [a for a in attachments if a.doc_type is not None and a.confidence is not None]
     has_body = body.label is not None and body.confidence is not None

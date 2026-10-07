@@ -45,7 +45,7 @@ class EmailClassifier:
         body_model: BodyModel,
         document_model: DocumentModel,
         min_confidence: float = 0.5,
-        body_min_confidence: float = 0.9,
+        body_min_confidence: float = 0.7,
     ) -> None:
         self.body_model = body_model
         self.document_model = document_model

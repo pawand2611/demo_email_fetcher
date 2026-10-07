@@ -132,9 +132,9 @@ class CombineRuleTests(unittest.TestCase):
         self.assertEqual((d.decision, d.doc_type), (DECISION_PAYMENT, "invoice"))
 
     def test_payment_label_below_body_bar_is_review_not_payment(self) -> None:
-        d = combine(body("receipt", 0.75), [])
-        self.assertEqual((d.decision, d.doc_type, d.confidence), (DECISION_REVIEW, "receipt", 0.75))
-        self.assertIn("receipt below the 0.90 payment bar", d.reason)
+        d = combine(body("receipt", 0.65), [])
+        self.assertEqual((d.decision, d.doc_type, d.confidence), (DECISION_REVIEW, "receipt", 0.65))
+        self.assertIn("receipt below the 0.70 payment bar", d.reason)
         self.assertFalse(d.is_payment)
 
     def test_payment_label_below_review_floor_is_none(self) -> None:
@@ -153,7 +153,7 @@ class CombineRuleTests(unittest.TestCase):
     def test_unsure_invoice_body_with_decisive_non_invoice_attachment_is_review(self) -> None:
         d = combine(body("invoice", 0.55), [att("not_invoice", 0.90)])
         self.assertEqual(d.decision, DECISION_REVIEW)
-        self.assertIn("invoice below the 0.90 payment bar", d.reason)
+        self.assertIn("invoice below the 0.70 payment bar", d.reason)
 
     def test_plain_mail(self) -> None:
         d = combine(body("other", 0.80), [])
@@ -171,7 +171,7 @@ class CombineRuleTests(unittest.TestCase):
     def test_body_bar_is_configurable(self) -> None:
         self.assertEqual(combine(body("invoice", 0.92), [], body_min_confidence=0.95).decision, DECISION_REVIEW)
         self.assertEqual(combine(body("invoice", 0.96), [], body_min_confidence=0.95).decision, DECISION_PAYMENT)
-        self.assertEqual(combine(body("invoice", 0.92), []).decision, DECISION_PAYMENT)  # default bar 0.90
+        self.assertEqual(combine(body("invoice", 0.92), []).decision, DECISION_PAYMENT)  # default bar 0.70
 
     def test_attachment_bar_is_configurable(self) -> None:
         self.assertEqual(combine(body(None, None), [att("invoice", 0.75)], min_confidence=0.8).decision, DECISION_NONE)

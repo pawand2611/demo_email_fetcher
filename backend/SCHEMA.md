@@ -118,7 +118,7 @@ Two local models, run as a LangGraph flow (`classification_graph.py`): Laya
 (zero-shot) labels the email body, LayoutLMv3 (trained) labels each PDF or
 image attachment invoice / not_invoice. `classifier.combine` applies the
 decision rule; see the README table. In short: Laya counts as payment only at
-a score of 0.9 or more (`BODY_MIN_CONFIDENCE`), an invoice attachment from
+a score of 0.7 or more (`BODY_MIN_CONFIDENCE`; 0.9 until 2026-10-07), an invoice attachment from
 0.6; borderline payment evidence and contradictions between the models
 become `review`.
 
@@ -151,3 +151,4 @@ store refuses any key that could escape its root.
 - 2026-10-07: classification by two local models through LangGraph: Laya on
   the body (zero-shot), LayoutLMv3 on attachments (trained). `review` added
   as a decision. Laya counts as payment only at 0.9 or more.
+- 2026-10-07: payment bar for Laya lowered from 0.9 to 0.7 at the user's request.

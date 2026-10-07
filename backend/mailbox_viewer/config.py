@@ -43,7 +43,7 @@ class Settings:
     # Attachment model (LayoutLMv3): an invoice counts from this score.
     model_min_confidence: float = 0.5
     # Body model (Laya): a statement / invoice / receipt counts as payment only from this score.
-    body_min_confidence: float = 0.9
+    body_min_confidence: float = 0.7
     # Name of the business purpose this deployment serves.
     profile_name: str = "statement_recon"
 
@@ -63,7 +63,7 @@ _DEFAULTS = {
     "ATTACHMENT_DIR": "data/attachments",
     "STORE_ONLY_PAYMENT": "false",
     "MODEL_MIN_CONFIDENCE": "0.5",
-    "BODY_MIN_CONFIDENCE": "0.9",
+    "BODY_MIN_CONFIDENCE": "0.7",
     "ATTACHMENT_MODEL_DIR": "models/layoutlmv3_invoice",
     "BODY_MODEL_DIR": "models/laya",
     "PROFILE_NAME": "statement_recon",

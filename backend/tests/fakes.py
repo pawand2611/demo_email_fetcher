@@ -54,7 +54,7 @@ class FakeBodyModel:
         return Prediction("other", 0.80)
 
 
-def fake_classifier(body=None, document=None, min_confidence: float = 0.5, body_min_confidence: float = 0.9):
+def fake_classifier(body=None, document=None, min_confidence: float = 0.5, body_min_confidence: float = 0.7):
     """An EmailClassifier (the real LangGraph flow) over the fake models."""
     from mailbox_viewer.classification_graph import EmailClassifier
 
