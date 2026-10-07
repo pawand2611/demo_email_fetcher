@@ -52,13 +52,18 @@ class ApiClient:
     def start_sync(self) -> dict[str, Any]:
         return self._json("POST", "/sync")
 
+    def job(self, job_id: str) -> dict[str, Any]:
+        """State of a background job (sync or reclassify)."""
+        return self._json("GET", f"/jobs/{job_id}")
+
     def sync_job(self, job_id: str) -> dict[str, Any]:
-        return self._json("GET", f"/sync/{job_id}")
+        return self.job(job_id)
 
     def latest_sync(self) -> dict[str, Any] | None:
         return self._json("GET", "/sync/latest")
 
     def reclassify(self) -> dict[str, Any]:
+        """Start re-classifying all cached mail in the background; returns the job."""
         return self._json("POST", "/reclassify")
 
     # -- mail -----------------------------------------------------------------------

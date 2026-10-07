@@ -1,6 +1,4 @@
-"""The backend service: the only process that touches the mailbox, the
-database, the attachment files and the document model.
-
+"""
 Run with:
     cd backend
     python -m uvicorn api.main:create_app --factory --host 127.0.0.1 --port 8000
@@ -28,16 +26,17 @@ from sqlalchemy.schema import CheckConstraint, CreateIndex, CreateTable, Foreign
 
 from mailbox_viewer import repository as repo
 from mailbox_viewer.attachment_store import AttachmentStoreError, FileSystemStore, build_store
-from mailbox_viewer.classifier import PAYMENT_LABELS, DocumentModel
+from mailbox_viewer.classification_graph import EmailClassifier
+from mailbox_viewer.classifier import PAYMENT_LABELS
 from mailbox_viewer.config import Settings, load_settings
 from mailbox_viewer.db import init_db, make_engine, make_session_factory
-from mailbox_viewer.document_model import load_model
+from mailbox_viewer.document_model import load_classifier
 from mailbox_viewer.mail_client import MailClient
 from mailbox_viewer.models import Base
 from mailbox_viewer.sync import ClientFactory, SyncResult, run_sync
 
 from . import schemas as s
-from .jobs import SyncJob, SyncJobs
+from .jobs import KIND_RECLASSIFY, KIND_REDECIDE, KIND_SYNC, Job, Jobs
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +53,7 @@ class Services:
     engine: Engine
     session_factory: sessionmaker[Session]
     store: FileSystemStore
-    model: DocumentModel
+    classifier: EmailClassifier
     client_factory: ClientFactory = MailClient
 
 
@@ -67,21 +66,39 @@ def build_services(settings: Settings | None = None) -> Services:
         engine=engine,
         session_factory=make_session_factory(engine),
         store=build_store(settings),
-        model=load_model(settings),
+        classifier=load_classifier(settings),
     )
 
 
 def create_app(services: Services | None = None) -> FastAPI:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     svc = services or build_services()
-    jobs = SyncJobs(
-        lambda: run_sync(svc.settings, svc.session_factory, svc.client_factory, store=svc.store, model=svc.model)
-    )
+    jobs = Jobs()
+
+    def run_sync_job() -> SyncResult:
+        return run_sync(svc.settings, svc.session_factory, svc.client_factory, store=svc.store, classifier=svc.classifier)
+
+    def run_reclassify_job() -> dict:
+        with svc.session_factory() as session, session.begin():
+            changed = repo.reclassify_all(session, svc.store, svc.classifier)
+        return s.ReclassifyOut(changed=changed, model=svc.classifier.name).model_dump()
+
+    def run_redecide_job() -> dict:
+        with svc.session_factory() as session, session.begin():
+            changed = repo.redecide_all(session, svc.classifier)
+        return {"changed": changed, "body_min_confidence": svc.settings.body_min_confidence,
+                "model_min_confidence": svc.settings.model_min_confidence}
+
+    def start_job(kind: str, run) -> s.JobOut:
+        job, started = jobs.start(kind, run)
+        if not started and job.kind != kind:
+            raise HTTPException(409, f"a {job.kind} job is running; try again when it has finished")
+        return _job_out(job)
 
     app = FastAPI(
         title="Mailbox Viewer API",
         version="1.0",
-        description="Syncs a mailbox into the cache, classifies attachments with the document model, and serves the results.",
+        description="Syncs a mailbox into the cache, classifies each email with two local models (Laya on the body, LayoutLMv3 on attachments) through a LangGraph flow, and serves the results.",
     )
     app.state.services = svc
     app.state.jobs = jobs
@@ -93,9 +110,9 @@ def create_app(services: Services | None = None) -> FastAPI:
         try:
             with svc.session_factory() as session:
                 session.execute(text("select 1"))
-            return s.HealthOut(status="ok", database="ok", model=svc.model.name)
+            return s.HealthOut(status="ok", database="ok", model=svc.classifier.name)
         except Exception as exc:
-            return s.HealthOut(status="degraded", database="error", database_error=_short(exc), model=svc.model.name)
+            return s.HealthOut(status="degraded", database="error", database_error=_short(exc), model=svc.classifier.name)
 
     @app.get("/profiles", response_model=list[s.ProfileOut], tags=["service"])
     def profiles() -> list[s.ProfileOut]:
@@ -107,8 +124,9 @@ def create_app(services: Services | None = None) -> FastAPI:
                 mailbox=st_.imap_user,
                 folders=list(st_.imap_folders),
                 keep_policy="payment_only" if st_.store_only_payment else "every_message",
-                model=svc.model.name,
+                model=svc.classifier.name,
                 model_min_confidence=st_.model_min_confidence,
+                body_min_confidence=st_.body_min_confidence,
                 payment_labels=sorted(PAYMENT_LABELS),
                 attachment_store=svc.store.describe(),
             )
@@ -125,6 +143,7 @@ def create_app(services: Services | None = None) -> FastAPI:
                 emails=emails,
                 attachments=repo.count_attachments(session),
                 payment_threads=repo.count_payment_threads(session),
+                needs_review=repo.count_by_decision(session).get("review", 0),
                 judged=judged,
                 dropped=max(judged - emails, 0),
                 by_doc_type=repo.count_by_doc_type(session),
@@ -142,32 +161,33 @@ def create_app(services: Services | None = None) -> FastAPI:
 
     # -- sync and classification ----------------------------------------------------------
 
-    @app.post("/sync", response_model=s.SyncJobOut, status_code=202, tags=["sync"])
-    def start_sync() -> s.SyncJobOut:
+    @app.post("/sync", response_model=s.JobOut, status_code=202, tags=["jobs"])
+    def start_sync() -> s.JobOut:
         """Start an incremental sync in the background, or return the one already running."""
-        job, _started = jobs.start()
-        return _job_out(job)
+        return start_job(KIND_SYNC, run_sync_job)
 
-    @app.get("/sync/latest", response_model=s.SyncJobOut | None, tags=["sync"])
-    def latest_sync() -> s.SyncJobOut | None:
-        job = jobs.latest()
+    @app.post("/reclassify", response_model=s.JobOut, status_code=202, tags=["jobs"])
+    def reclassify() -> s.JobOut:
+        """Re-run both models over every cached email in the background. No mail-server contact."""
+        return start_job(KIND_RECLASSIFY, run_reclassify_job)
+
+    @app.post("/redecide", response_model=s.JobOut, status_code=202, tags=["jobs"])
+    def redecide() -> s.JobOut:
+        """Re-apply the decision rule to stored predictions. No models, no mail server; takes seconds."""
+        return start_job(KIND_REDECIDE, run_redecide_job)
+
+    @app.get("/sync/latest", response_model=s.JobOut | None, tags=["jobs"])
+    def latest_sync() -> s.JobOut | None:
+        job = jobs.latest(KIND_SYNC)
         return _job_out(job) if job else None
 
-    @app.get("/sync/{job_id}", response_model=s.SyncJobOut, tags=["sync"])
-    def sync_status(job_id: str) -> s.SyncJobOut:
+    @app.get("/jobs/{job_id}", response_model=s.JobOut, tags=["jobs"])
+    @app.get("/sync/{job_id}", response_model=s.JobOut, tags=["jobs"], include_in_schema=False)
+    def job_status(job_id: str) -> s.JobOut:
         job = jobs.get(job_id)
         if job is None:
-            raise HTTPException(404, f"no sync job {job_id!r}")
+            raise HTTPException(404, f"no job {job_id!r}")
         return _job_out(job)
-
-    @app.post("/reclassify", response_model=s.ReclassifyOut, tags=["sync"])
-    def reclassify() -> s.ReclassifyOut:
-        """Re-run the document model over every cached email. No mail-server contact."""
-        if jobs.is_running:
-            raise HTTPException(409, "a sync is running; try again when it has finished")
-        with svc.session_factory() as session, session.begin():
-            changed = repo.reclassify_all(session, svc.store, svc.model, svc.settings.model_min_confidence)
-        return s.ReclassifyOut(changed=changed, model=svc.model.name)
 
     # -- mail ---------------------------------------------------------------------------
 
@@ -345,13 +365,18 @@ def _message_out(d: repo.EmailDetail, decision: repo.DecisionInfo | None) -> s.M
     )
 
 
-def _job_out(job: SyncJob) -> s.SyncJobOut:
-    return s.SyncJobOut(
+def _job_out(job: Job) -> s.JobOut:
+    if isinstance(job.result, SyncResult):
+        result = _result_out(job.result).model_dump()
+    else:
+        result = job.result
+    return s.JobOut(
         id=job.id,
+        kind=job.kind,
         state=job.state,
         started_at=job.started_at,
         finished_at=job.finished_at,
-        result=_result_out(job.result) if job.result else None,
+        result=result,
         error=job.error,
     )
 

@@ -36,7 +36,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 PARTICIPANT_ROLES = ("from", "to", "cc", "bcc")
 DOC_TYPES = ("statement", "invoice", "receipt", "other")
-DECISIONS = ("payment", "none")
+DECISIONS = ("payment", "none", "review")
 
 
 def utcnow_naive() -> datetime:
@@ -145,7 +145,7 @@ class SyncState(Base):
 class DecisionLog(Base):
     __tablename__ = "decision_log"
     __table_args__ = (
-        CheckConstraint("decision IN ('payment', 'none')", name="ck_decision_log_decision"),
+        CheckConstraint("decision IN ('payment', 'none', 'review')", name="ck_decision_log_decision"),
         CheckConstraint("confidence IS NULL OR (confidence >= 0 AND confidence <= 1)", name="ck_decision_log_confidence"),
     )
 

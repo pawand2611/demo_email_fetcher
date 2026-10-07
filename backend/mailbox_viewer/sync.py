@@ -5,7 +5,7 @@
    rescan never re-judges a message.
 3. **Find the thread.** A reply into a thread already flagged as payment is
    kept before classification even runs.
-4. **Classify** with the trained document model and write the decision line.
+4. **Classify** with both models (LangGraph flow) and write the decision line.
 5. **Keep?** A payment document, or mail in a payment thread, is saved in one
    transaction: thread, email, participants, attachments; files go to the
    store first. When a thread turns into a payment thread, its earlier mail
@@ -28,9 +28,10 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from . import repository as repo
 from .attachment_store import AttachmentStoreError, FileSystemStore, build_store
-from .classifier import AttachmentInput, Decision, DocumentModel, classify
+from .classification_graph import EmailClassifier
+from .classifier import Decision, EmailInput
 from .config import Settings
-from .document_model import load_model
+from .document_model import load_classifier
 from .mail_client import MailClient, MailClientError, MailConnectionLost
 from .mail_parser import ParsedEmail, parse_message
 from .threads import ancestor_ids
@@ -103,17 +104,17 @@ def run_sync(
     session_factory: sessionmaker[Session],
     client_factory: ClientFactory = MailClient,
     store: FileSystemStore | None = None,
-    model: DocumentModel | None = None,
+    classifier: EmailClassifier | None = None,
 ) -> SyncResult:
     """Sync every folder in ``settings.imap_folders``, each with its own
     bookmark. Messages from all folders land in the same threads."""
     started = time.monotonic()
     result = SyncResult(status=STATUS_OK)
     store = store or build_store(settings)
-    model = model or load_model(settings)
+    classifier = classifier or load_classifier(settings)
 
     for folder in settings.imap_folders:
-        folder_result = _sync_folder(settings, folder, session_factory, client_factory, store, model, result)
+        folder_result = _sync_folder(settings, folder, session_factory, client_factory, store, classifier, result)
         result.folders.append(folder_result)
         if folder_result.status == STATUS_FAILED:
             result.status = STATUS_FAILED
@@ -133,7 +134,7 @@ def _sync_folder(
     session_factory: sessionmaker[Session],
     client_factory: ClientFactory,
     store: FileSystemStore,
-    model: DocumentModel,
+    classifier: EmailClassifier,
     totals: SyncResult,
 ) -> FolderResult:
     fr = FolderResult(folder=folder)
@@ -161,7 +162,7 @@ def _sync_folder(
             )
 
             processor = _Processor(
-                client, session_factory, store, model, settings.model_min_confidence, settings.store_only_payment, totals
+                client, session_factory, store, classifier, settings.store_only_payment, totals
             )
             for uid in uids:  # ascending, so last_seen_uid only ever moves forward
                 processor.process(uid)
@@ -197,21 +198,19 @@ class _Processor:
         client: MailSource,
         session_factory,
         store: FileSystemStore,
-        model: DocumentModel,
-        min_confidence: float,
+        classifier: EmailClassifier,
         store_only_payment: bool,
         result: SyncResult,
     ) -> None:
         self.client = client
         self.session_factory = session_factory
         self.store = store
-        self.model = model
-        self.min_confidence = min_confidence
+        self.classifier = classifier
         self.store_only_payment = store_only_payment
         self.result = result
 
     def _classify(self, mail: ParsedEmail) -> Decision:
-        return classify(AttachmentInput.all_from_parsed(mail), self.model, self.min_confidence)
+        return self.classifier.classify(EmailInput.from_parsed(mail))
 
     def process(self, uid: int) -> None:
         try:
@@ -258,7 +257,7 @@ class _Processor:
             thread_id = repo.find_thread_id(session, mail)
             in_payment_thread = thread_id is not None and repo.thread_has_payment(session, thread_id)
 
-        # Step 4: classify with the document model; every message gets a decision line.
+        # Step 4: classify with both models; every message gets a decision line.
         decision = self._classify(mail)
         if in_payment_thread and not decision.is_payment:
             decision = decision.with_note("kept as part of a payment thread")

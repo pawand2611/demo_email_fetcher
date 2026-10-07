@@ -23,6 +23,7 @@ class ProfileOut(BaseModel):
     keep_policy: str  # every_message | payment_only
     model: str
     model_min_confidence: float
+    body_min_confidence: float
     payment_labels: list[str]
     attachment_store: str
 
@@ -39,6 +40,7 @@ class StatsOut(BaseModel):
     emails: int
     attachments: int
     payment_threads: int
+    needs_review: int
     judged: int
     dropped: int
     by_doc_type: dict[str, int]
@@ -129,18 +131,22 @@ class SyncResultOut(BaseModel):
     folders: list[FolderResultOut]
 
 
-class SyncJobOut(BaseModel):
-    id: str
-    state: str  # running | succeeded | failed
-    started_at: datetime
-    finished_at: datetime | None
-    result: SyncResultOut | None
-    error: str | None
-
-
 class ReclassifyOut(BaseModel):
     changed: int
     model: str
+
+
+class JobOut(BaseModel):
+    """A background job. ``result`` has the SyncResultOut fields for kind
+    ``sync`` and the ReclassifyOut fields for kind ``reclassify``."""
+
+    id: str
+    kind: str  # sync | reclassify
+    state: str  # running | succeeded | failed
+    started_at: datetime
+    finished_at: datetime | None
+    result: dict[str, Any] | None
+    error: str | None
 
 
 class TableInfoOut(BaseModel):

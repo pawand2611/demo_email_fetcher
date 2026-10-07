@@ -23,7 +23,7 @@ def stub_backend(request: httpx.Request) -> httpx.Response:
     if request.method == "POST" and path == "/sync":
         return httpx.Response(202, json={"id": "job1", "state": "running", "started_at": "2026-10-07T09:00:00Z",
                                          "finished_at": None, "result": None, "error": None})
-    if request.method == "GET" and path == "/sync/job1":
+    if request.method == "GET" and path in ("/sync/job1", "/jobs/job1"):
         return httpx.Response(200, json={"id": "job1", "state": "succeeded", "started_at": "2026-10-07T09:00:00Z",
                                          "finished_at": "2026-10-07T09:00:05Z", "result": {"status": "ok"}, "error": None})
     if request.method == "GET" and path == "/threads":

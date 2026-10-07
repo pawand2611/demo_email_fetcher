@@ -9,11 +9,12 @@ from mailbox_viewer.classifier import AttachmentInput, Prediction
 
 
 class FakeDocumentModel:
-    """Predicts from the filename so tests are deterministic: names containing
-    "statement", "invoice" or "receipt" get that label at 0.95, anything else
-    is "other" at 0.60. ``overrides`` and ``fail_on`` target single files."""
+    """Stands in for the LayoutLMv3 attachment model. Predicts from the
+    filename so tests are deterministic: names containing "invoice" are
+    ``invoice`` at 0.95, anything else ``not_invoice`` at 0.90.
+    ``overrides`` and ``fail_on`` target single files."""
 
-    name = "fake"
+    name = "fake-attachment"
 
     def __init__(self) -> None:
         self.overrides: dict[str, Prediction] = {}
@@ -26,11 +27,38 @@ class FakeDocumentModel:
             raise RuntimeError("model could not read the file")
         if attachment.filename in self.overrides:
             return self.overrides[attachment.filename]
-        lowered = attachment.filename.lower()
-        for label in ("statement", "invoice", "receipt"):
-            if label in lowered:
-                return Prediction(label, 0.95)
-        return Prediction("other", 0.60)
+        if "invoice" in attachment.filename.lower():
+            return Prediction("invoice", 0.95)
+        return Prediction("not_invoice", 0.90)
+
+
+class FakeBodyModel:
+    """Stands in for Laya. Picks the document type from words in the subject
+    and body: statement 0.93, invoice 0.92, receipt 0.91, otherwise other 0.80.
+    ``overrides`` maps a subject to a fixed prediction."""
+
+    name = "fake-body"
+
+    def __init__(self) -> None:
+        self.overrides: dict[str, Prediction] = {}
+        self.calls: list[str] = []
+
+    def predict(self, subject: str, body: str) -> Prediction | None:
+        self.calls.append(subject)
+        if subject in self.overrides:
+            return self.overrides[subject]
+        text = f"{subject} {body}".lower()
+        for label, score in (("statement", 0.93), ("invoice", 0.92), ("receipt", 0.91)):
+            if label in text:
+                return Prediction(label, score)
+        return Prediction("other", 0.80)
+
+
+def fake_classifier(body=None, document=None, min_confidence: float = 0.5, body_min_confidence: float = 0.9):
+    """An EmailClassifier (the real LangGraph flow) over the fake models."""
+    from mailbox_viewer.classification_graph import EmailClassifier
+
+    return EmailClassifier(body or FakeBodyModel(), document or FakeDocumentModel(), min_confidence, body_min_confidence)
 
 
 def build_message(

@@ -20,7 +20,7 @@ from mailbox_viewer.mail_client import MailClientError, MailConnectionLost
 from mailbox_viewer.models import Attachment, DecisionLog, Email, EmailParticipant, Thread
 from mailbox_viewer.sync import STATUS_FAILED, STATUS_OK, STATUS_PARTIAL, run_sync
 
-from .fakes import FakeDocumentModel, FakeMailClient, FakeMailServer, build_message
+from .fakes import FakeMailClient, FakeMailServer, build_message, fake_classifier
 
 PDF = b"%PDF-1.4 pretend statement"
 
@@ -48,7 +48,7 @@ class SyncTests(unittest.TestCase):
         self.server = FakeMailServer()
         self.servers: dict[str, FakeMailServer] = {}  # extra folders for multi-folder tests
         self.store = FileSystemStore(self.att_dir)
-        self.model = FakeDocumentModel()
+        self.classifier = fake_classifier()
 
     def tearDown(self) -> None:
         self.engine.dispose()
@@ -73,7 +73,7 @@ class SyncTests(unittest.TestCase):
 
     def sync(self, **overrides):
         settings = dataclasses.replace(self.settings, **overrides)
-        return run_sync(settings, self.factory, lambda _s, folder: FakeMailClient(self.servers.get(folder, self.server), folder), store=self.store, model=self.model)
+        return run_sync(settings, self.factory, lambda _s, folder: FakeMailClient(self.servers.get(folder, self.server), folder), store=self.store, classifier=self.classifier)
 
     def counts(self) -> tuple[int, int, int, int]:
         with self.factory() as session:
@@ -192,7 +192,7 @@ class SyncTests(unittest.TestCase):
             self.assertEqual(thread.last_message_at.hour, 11)
             emails = repo.list_thread_emails(session, thread.id)
         self.assertEqual([e.subject for e in emails], ["Re: Re: Invoice #42", "Re: Invoice #42", "Invoice #42"])
-        self.assertEqual([e.matched_directly for e in emails], [False, True, False])
+        self.assertEqual([e.matched_directly for e in emails], [True, True, True])
 
     def test_reply_to_uncached_root_joins_a_cached_ancestor(self) -> None:
         # The root itself is older than the sync window; only a later reply is cached.
@@ -217,18 +217,18 @@ class SyncTests(unittest.TestCase):
             detail = repo.get_email_detail(session, email.id)
 
         self.assertEqual(people, [("from", "statements@acme.example"), ("to", "me@example.com"), ("cc", "partner@example.com")])
-        self.assertEqual((email.doc_type, email.confidence, email.matched_directly), ("statement", 0.95, True))
+        self.assertEqual((email.doc_type, email.confidence, email.matched_directly), ("statement", 0.93, True))
         self.assertEqual(att.blob_key, f"{hashlib.sha256(PDF).hexdigest()}/statement_aug.pdf")
-        self.assertEqual((att.doc_type, att.confidence), ("statement", 0.95))
+        self.assertEqual((att.doc_type, att.confidence), ("not_invoice", 0.90))
         self.assertTrue((self.att_dir / hashlib.sha256(PDF).hexdigest() / "statement_aug.pdf").exists())
-        self.assertEqual((log.tier, log.decision, log.confidence), (1, "payment", 0.95))
+        self.assertEqual((log.tier, log.decision, log.confidence), (3, "payment", 0.93))
         self.assertIn("statement_aug.pdf", log.reason)
         self.assertEqual(files[0].content, PDF)
         self.assertEqual([p.address for p in detail.by_role("cc")], ["partner@example.com"])
 
         with self.factory() as session:
             plain = session.get(DecisionLog, "<m3@x>")
-        self.assertEqual((plain.tier, plain.decision, plain.confidence), (0, "none", None))
+        self.assertEqual((plain.tier, plain.decision, plain.confidence), (2, "none", 0.80))
 
     def test_missing_file_is_reported_per_attachment(self) -> None:
         self.seed_three_messages()
@@ -241,6 +241,24 @@ class SyncTests(unittest.TestCase):
         self.assertIsNone(files[0].content)
         self.assertIn("missing", files[0].error)
 
+    def test_redecide_applies_a_stricter_body_bar_without_running_models(self) -> None:
+        self.seed_three_messages()
+        self.sync()  # statement email: body statement 0.93 -> payment under the default 0.90 bar
+        self.classifier.body_model.calls.clear()
+        strict = fake_classifier(self.classifier.body_model, self.classifier.document_model, body_min_confidence=0.95)
+
+        with self.factory() as session, session.begin():
+            changed = repo.redecide_all(session, strict)
+
+        self.assertEqual(changed, 1)
+        self.assertEqual(self.classifier.body_model.calls, [])  # no model was run
+        with self.factory() as session:
+            self.assertEqual(repo.count_by_decision(session), {"review": 1, "none": 2})
+            self.assertEqual(repo.count_payment_threads(session), 0)
+            self.assertIn("statement below the 0.95 payment bar", session.get(DecisionLog, "<m2@x>").reason)
+        with self.factory() as session, session.begin():
+            self.assertEqual(repo.redecide_all(session, strict), 0)
+
     def test_reclassify_repairs_labels_and_thread_flags(self) -> None:
         self.seed_three_messages()
         self.sync()
@@ -250,15 +268,15 @@ class SyncTests(unittest.TestCase):
             session.execute(update(DecisionLog).values(decision="none", tier=0))
 
         with self.factory() as session, session.begin():
-            changed = repo.reclassify_all(session, self.store, self.model)
+            changed = repo.reclassify_all(session, self.store, self.classifier)
 
-        self.assertEqual(changed, 1)
+        self.assertEqual(changed, 3)
         self.assertEqual(self.counts()[3], 1)
         with self.factory() as session:
             self.assertEqual(session.get(DecisionLog, "<m2@x>").decision, "payment")
             self.assertEqual(repo.count_by_decision(session), {"payment": 1, "none": 2})
         with self.factory() as session, session.begin():
-            self.assertEqual(repo.reclassify_all(session, self.store, self.model), 0)
+            self.assertEqual(repo.reclassify_all(session, self.store, self.classifier), 0)
 
     # -- resilience ---------------------------------------------------------------------
 
@@ -322,7 +340,7 @@ class SyncTests(unittest.TestCase):
                 raise MailClientError("no such folder")
             return FakeMailClient(self.server, folder)
 
-        result = run_sync(dataclasses.replace(self.settings, imap_folders=("INBOX", "BROKEN")), self.factory, factory, store=self.store, model=self.model)
+        result = run_sync(dataclasses.replace(self.settings, imap_folders=("INBOX", "BROKEN")), self.factory, factory, store=self.store, classifier=self.classifier)
         self.assertEqual(result.status, STATUS_FAILED)
         self.assertIn("BROKEN", result.error)
         self.assertEqual(result.kept, 3)
@@ -413,7 +431,7 @@ class KeepOnlyPaymentFlowTests(SyncTests):
         with self.factory() as session:
             self.assertEqual(repo.count_emails(session), 1)
             plain = session.get(DecisionLog, "<m3@x>")
-        self.assertEqual((plain.tier, plain.decision), (0, "none"))
+        self.assertEqual((plain.tier, plain.decision), (2, "none"))
 
     def test_missing_file_is_reported_per_attachment(self) -> None:
         super().test_missing_file_is_reported_per_attachment()
@@ -464,7 +482,7 @@ class KeepOnlyPaymentFlowTests(SyncTests):
     def test_reply_into_payment_thread_is_kept_without_its_own_match(self) -> None:
         self.server.add(1, build_message(subject="Invoice #42", message_id="<root@x>", attachments=[("invoice_42.pdf", "application/pdf", PDF)]))
         self.sync()
-        self.server.add(2, build_message(subject="Re: Invoice #42", sender="Ravi <ravi@example.com>", message_id="<reply@x>", in_reply_to="<root@x>", references="<root@x>", text="Thanks, paid."))
+        self.server.add(2, build_message(subject="Re: thanks", sender="Ravi <ravi@example.com>", message_id="<reply@x>", in_reply_to="<root@x>", references="<root@x>", text="Thanks, done."))
 
         result = self.sync()
 

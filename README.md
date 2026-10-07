@@ -70,8 +70,9 @@ Pages:
 | `GET /profiles` | the active business-purpose profile: mailbox, folders, keep policy, model |
 | `GET /stats` | counts and per-folder sync bookmarks |
 | `POST /sync` | start an incremental sync in the background; returns a job, or the one already running |
-| `GET /sync/{job_id}`, `GET /sync/latest` | job state and result |
-| `POST /reclassify` | re-run the document model over cached mail |
+| `GET /jobs/{job_id}`, `GET /sync/latest` | state and result of a background job |
+| `POST /reclassify` | re-run both models over cached mail, in the background |
+| `POST /redecide` | re-apply the decision rule to stored predictions, in the background |
 | `GET /threads?payment_only&search&limit` | conversation list |
 | `GET /threads/{id}` | every message with participants, attachments and decision |
 | `GET /attachments/{id}` | file download |
@@ -119,7 +120,8 @@ python create_schema.py --ddl sqlite   # print the schema DDL (or postgresql); -
 python fetch_mail.py --limit 10        # M0: connect and print, no database
 python sync_mail.py                    # one sync run, prints counts before/after
 python sync_mail.py --reset-state      # forget the resume point and re-walk (still 0 new)
-python sync_mail.py --reclassify       # re-run the document model over the cache only
+python sync_mail.py --reclassify       # re-run both models over the cache (slow)
+python sync_mail.py --redecide         # re-apply the decision rule to stored predictions (fast)
 python -m unittest -v                  # backend tests, no mailbox needed
 ```
 
@@ -157,22 +159,64 @@ shows how many messages were judged versus stored.
 
 ## Classification
 
-Classification comes only from a trained document model (LayoutLMv3); there
-are no keyword rules. The model reads each PDF or image attachment and
-returns a label and a score. Each attachment stores its own `doc_type` and
-`confidence`. The message takes the strongest prediction and is a `payment`
-decision when that label is statement, invoice or receipt and the score is at
-least `MODEL_MIN_CONFIDENCE`. Everything goes to `decision_log` with tier 1
-for a model prediction, or tier 0 when nothing could be classified.
+Each email is classified by two local models, run as a LangGraph flow
+(`backend/mailbox_viewer/classification_graph.py`):
 
-**Current state: no model is loaded.** With `MODEL_PATH` empty, attachments
-stay unclassified with the reason "no classification model configured", and
-every message is still stored. The LayoutLMv3 adapter is added in
-`mailbox_viewer/document_model.py` when the trained model joins the project.
-It must load from the local folder with Hugging Face offline mode and
-telemetry disabled; weights stay out of git.
+```
+START ─┬─> classify_body (Laya, email body) ─────────────────┬─> combine ─> END
+       └─> classify_attachments (LayoutLMv3, each PDF/image) ─┘
+```
 
-Full design and ERD: [backend/SCHEMA.md](backend/SCHEMA.md).
+- **Laya** (`convaiinnovations/laya`, zero-shot) answers "what kind of
+  document does this email send?": invoice, receipt, statement, purchase
+  order, quotation or other, with a score.
+- **LayoutLMv3** (trained by the team, invoice vs not invoice) reads the first
+  page of each PDF, JPG, PNG or DOCX attachment.
+
+Decision rule:
+
+| Evidence | Decision |
+|---|---|
+| Laya says statement, invoice or receipt with score ≥ `BODY_MIN_CONFIDENCE` (0.9) | payment |
+| An attachment is an invoice with score ≥ 0.6 | payment |
+| Laya says a payment type with score 0.5 to 0.9 | review |
+| An attachment is an invoice with score 0.5 to 0.6 | review |
+| The two models contradict each other on "invoice" | review |
+| Anything else, including low scores on "other" | none |
+
+Each email's decision, tier (0 nothing classified, 1 attachment model, 2 body
+model, 3 both), score and reason go to `decision_log`; each attachment keeps
+its own label and score.
+
+Both models load only from local folders (`backend/models/`, git-ignored).
+Hugging Face offline mode and telemetry and LangSmith tracing are forced off
+in `mailbox_viewer/__init__.py`. Model inference runs on one dedicated thread
+to keep PyTorch from spawning hundreds of threads. On a laptop CPU, Laya takes
+about 6 seconds per real email.
+
+- **Re-run classifier** (sidebar, `POST /reclassify`, `sync_mail.py --reclassify`):
+  runs both models again over all cached mail. Slow: about 25 minutes for 250 emails.
+- **Re-decide** (`POST /redecide`, `sync_mail.py --redecide`): re-applies the
+  decision rule to the stored predictions after changing a threshold. No
+  models, takes about a minute.
+
+Model setup, once (weights are not in git):
+
+- LayoutLMv3: the inference code is copied in `backend/attachment_classifier/`
+  (see its `SOURCE.md`); weights `model.safetensors` (504 MB, Git LFS) and its
+  config/tokenizer files go to `backend/models/layoutlmv3_invoice/`.
+- Laya: `model.safetensors`, `rl_agent_api.py`, `rl_common.py`,
+  `email_utils.py`, `rl_agent_config.json`, `encoder/config.json`,
+  `tokenizer/tokenizer.json`, `tokenizer/tokenizer_config.json` from
+  huggingface.co/convaiinnovations/laya go to `backend/models/laya/`.
+- Images and scanned PDFs also need the **Tesseract** OCR program, installed
+  through your IT-approved route. Without it they are recorded as "OCR program
+  Tesseract is not installed" and the body model alone decides. DOCX needs
+  LibreOffice.
+
+Caution: Laya's 96 to 100% accuracy came from generated emails. On real mail
+it is weaker (for example real invoice replies labelled "purchase order"),
+which the 0.9 bar and the review state compensate for until it is fine-tuned.
 
 ## Layout
 
@@ -187,8 +231,9 @@ backend/                      the API service: the only part that touches mail, 
     mail_client.py            IMAP session: search UIDs, fetch raw bytes
     mail_parser.py            raw bytes -> ParsedEmail (headers, participants, bodies, attachments)
     threads.py                conversation key from threading headers
-    classifier.py             model-based classification and decision
-    document_model.py         loads the trained document model (LayoutLMv3 slot)
+    classifier.py             the two classification steps and the decision rule
+    classification_graph.py   LangGraph flow: body + attachments in parallel, then combine
+    document_model.py         loads Laya and LayoutLMv3 from backend/models/
     attachment_store.py       file-system store for attachment bytes
     models.py                 SQLAlchemy models: threads, emails, email_participants,
                               attachments, sync_state, decision_log
@@ -200,6 +245,8 @@ backend/                      the API service: the only part that touches mail, 
   fetch_mail.py               M0 script: connect, fetch, print
   sync_mail.py                run one sync and print counts
   tests/                      parser, threads, classifier, store, sync, schema, API
+  attachment_classifier/      LayoutLMv3 inference code, copied from the model repo
+  models/                     model weights (git-ignored)
   SCHEMA.md                   schema design, ERD, refresh flow, history
   requirements.txt
   data/                       attachment files (git-ignored)

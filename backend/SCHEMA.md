@@ -67,8 +67,8 @@ erDiagram
     }
     DECISION_LOG {
         text     message_id PK
-        int      tier       "1 model prediction, 0 nothing classified"
-        text     decision   "payment | none"
+        int      tier       "0 nothing, 1 attachment model, 2 body model, 3 both"
+        text     decision   "payment | none | review"
         float    confidence
         text     reason
         datetime decided_at
@@ -104,7 +104,7 @@ The bookmark is read first and moved last.
 | 2 | Fetch UIDs above `last_seen_uid` over IMAP | | |
 | 3 | **Already judged?** If `decision_log` has the Message-ID, skip. A rescan never re-judges. | `decision_log`, `emails` | |
 | 4 | **Find the thread.** A reply into a thread with `has_payment` is kept regardless of its own content. | `threads`, `emails` | |
-| 5 | **Classify** with the document model | | `decision_log` |
+| 5 | **Classify** with both models (LangGraph: Laya on the body, LayoutLMv3 on attachments, then the decision rule) | | `decision_log` |
 | 6 | **Keep?** Payment document, or payment thread, or `STORE_ONLY_PAYMENT=false` (the default) → save. Otherwise drop: only the log line is written. | | |
 | 7 | **Save in one transaction**: thread (found or created), email, participants, attachments. Files were written to the store just before. When a thread turns into a payment thread, its earlier mail that was dropped is backfilled from the mailbox by Message-ID. | | `threads`, `emails`, `email_participants`, `attachments`, files |
 | 8 | Move the bookmark | | `sync_state` |
@@ -114,24 +114,20 @@ Streamlit reads `threads`, `emails`, `email_participants`, `attachments` and
 
 ## Classification
 
-Classification comes only from a trained document model (LayoutLMv3);
-keyword rules were removed on 2026-10-06. `mailbox_viewer/classifier.py`
-produces one decision per message:
+Two local models, run as a LangGraph flow (`classification_graph.py`): Laya
+(zero-shot) labels the email body, LayoutLMv3 (trained) labels each PDF or
+image attachment invoice / not_invoice. `classifier.combine` applies the
+decision rule; see the README table. In short: Laya counts as payment only at
+a score of 0.9 or more (`BODY_MIN_CONFIDENCE`), an invoice attachment from
+0.6; borderline payment evidence and contradictions between the models
+become `review`.
 
-| Tier | Meaning | `decision` |
-|---|---|---|
-| 1 | the model labelled at least one PDF or image attachment | `payment` if the strongest label is statement, invoice or receipt and its score is at least `MODEL_MIN_CONFIDENCE`, else `none` |
-| 0 | nothing classified: no model configured, no PDF or image attached, or the model failed on every file | `none` |
-
-Each attachment stores the model's own label and score in
-`attachments.doc_type` / `confidence`; the message takes the strongest one.
-The reason names the model, the file, the label and the score. A model error
-on one file is logged and does not stop the others or the sync.
-
-The model sits behind a two-member interface (`name`, `predict(attachment)`),
-loaded by `mailbox_viewer/document_model.py` from `MODEL_PATH`. Until the
-trained LayoutLMv3 model is added, `MODEL_PATH` is empty and every message is
-tier 0 with "no classification model configured".
+`decision_log.decision` allows `payment`, `none` and `review` (the `review`
+value was added on 2026-10-07; `init_db` upgrades the PostgreSQL check
+constraint in place). `tier`: 0 nothing classified, 1 attachment model only,
+2 body model only, 3 both. The reason always starts with the body model's
+label and score (`body: receipt (0.75) ...`), which is what lets `--redecide`
+re-apply a changed rule without running the models again.
 
 ## Attachments
 
@@ -152,3 +148,6 @@ store refuses any key that could escape its root.
 - 2026-10-06: keyword rules removed; classification comes only from the
   trained document model. The app split into a backend API (FastAPI) and a
   Streamlit frontend that talks to it over HTTP.
+- 2026-10-07: classification by two local models through LangGraph: Laya on
+  the body (zero-shot), LayoutLMv3 on attachments (trained). `review` added
+  as a decision. Laya counts as payment only at 0.9 or more.

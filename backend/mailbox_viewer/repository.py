@@ -8,6 +8,8 @@ care about session lifetimes or lazy loading.
 
 from __future__ import annotations
 
+import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Sequence
@@ -16,10 +18,13 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from .attachment_store import AttachmentStoreError, FileSystemStore
-from .classifier import AttachmentInput, Decision, DocumentModel, classify
+from .classification_graph import EmailClassifier
+from .classifier import AttachmentDecision, AttachmentInput, Decision, EmailInput, body_decision_from_reason
 from .mail_parser import ParsedEmail
 from .models import Attachment, DecisionLog, Email, EmailParticipant, SyncState, Thread, to_naive_utc, utcnow_naive
 from .threads import ancestor_ids, conversation_key
+
+logger = logging.getLogger(__name__)
 
 # -- read models -----------------------------------------------------------------
 
@@ -232,11 +237,19 @@ def _thread_for(session: Session, mail: ParsedEmail) -> Thread:
     return thread
 
 
-def _log_decision(session: Session, message_id: str, decision: Decision) -> None:
-    log = session.get(DecisionLog, message_id)
+_MISSING = object()
+
+
+def _log_decision(session: Session, message_id: str, decision: Decision, existing=_MISSING) -> None:
+    """Write the audit line; untouched when the decision has not changed."""
+    log = session.get(DecisionLog, message_id) if existing is _MISSING else existing
     if log is None:
         log = DecisionLog(message_id=message_id)
         session.add(log)
+    elif (log.tier, log.decision, log.confidence, log.reason) == (
+        decision.tier, decision.decision, decision.confidence, decision.reason
+    ):
+        return
     log.tier = decision.tier
     log.decision = decision.decision
     log.confidence = decision.confidence
@@ -244,19 +257,24 @@ def _log_decision(session: Session, message_id: str, decision: Decision) -> None
     log.decided_at = utcnow_naive()
 
 
-def reclassify_all(session: Session, store: FileSystemStore, model: DocumentModel, min_confidence: float = 0.5) -> int:
-    """Re-run the document model over every cached mail. Attachment bytes come
-    from the file store; the mail server is never contacted. Updates emails,
-    attachments, decision_log and thread roll-ups. Returns how many emails
-    changed."""
+def reclassify_all(session: Session, store: FileSystemStore, classifier: EmailClassifier) -> int:
+    """Re-run both models over every cached mail. Subject and body come from the
+    database, attachment bytes from the file store; the mail server is never
+    contacted. Updates emails, attachments, decision_log and thread roll-ups,
+    writing only rows that actually change. Returns how many emails changed."""
     changed = 0
     rows = session.scalars(select(Email).options(selectinload(Email.attachments))).all()
-    for row in rows:
+    logs = {log.message_id: log for log in session.scalars(select(DecisionLog))}  # one query, not one per email
+    started = time.monotonic()
+    for done, row in enumerate(rows, start=1):
+        if done % 25 == 0 or done == len(rows):
+            elapsed = time.monotonic() - started
+            logger.info("reclassify: %d/%d emails, %.1fs per email", done, len(rows), elapsed / done)
         inputs = tuple(
             AttachmentInput(a.filename, a.content_type, store.get(a.blob_key) if store.exists(a.blob_key) else None)
             for a in row.attachments
         )
-        decision = classify(inputs, model, min_confidence)
+        decision = classifier.classify(EmailInput(row.subject, row.body_text, inputs))
         before = (row.doc_type, row.confidence, row.decision_reason, row.matched_directly)
         row.doc_type = decision.doc_type
         row.confidence = decision.confidence
@@ -265,12 +283,51 @@ def reclassify_all(session: Session, store: FileSystemStore, model: DocumentMode
         for att, verdict in zip(row.attachments, decision.attachments):
             att.doc_type = verdict.doc_type
             att.confidence = verdict.confidence
-        _log_decision(session, row.message_id, decision)
+        _log_decision(session, row.message_id, decision, existing=logs.get(row.message_id))
         if before != (row.doc_type, row.confidence, row.decision_reason, row.matched_directly):
             changed += 1
     session.flush()
     _recompute_thread_flags(session)
     return changed
+
+
+def redecide_all(session: Session, classifier: EmailClassifier) -> int:
+    """Re-apply the decision rule to the predictions already stored, without
+    running the models: Laya's label and score come from the stored reason,
+    LayoutLMv3's from the attachments table. Takes seconds, not minutes.
+    Returns how many emails changed."""
+    changed = 0
+    rows = session.scalars(select(Email).options(selectinload(Email.attachments))).all()
+    logs = {log.message_id: log for log in session.scalars(select(DecisionLog))}
+    for row in rows:
+        log = logs.get(row.message_id)
+        reason = log.reason if log else row.decision_reason
+        stored_reason = (reason or "").split("; kept as part of")[0].split("; backfilled into")[0]
+        body = body_decision_from_reason(stored_reason)
+        attachments = tuple(
+            AttachmentDecision(a.doc_type, a.confidence, a.filename, None if a.doc_type else _note_for(stored_reason, a.filename))
+            for a in row.attachments
+        )
+        decision = classifier.combine(body, attachments)
+        before = (row.doc_type, row.confidence, row.decision_reason, row.matched_directly)
+        row.doc_type = decision.doc_type
+        row.confidence = decision.confidence
+        row.decision_reason = decision.reason
+        row.matched_directly = decision.is_payment
+        _log_decision(session, row.message_id, decision, existing=log)
+        if before != (row.doc_type, row.confidence, row.decision_reason, row.matched_directly):
+            changed += 1
+    session.flush()
+    _recompute_thread_flags(session)
+    return changed
+
+
+def _note_for(reason: str, filename: str) -> str | None:
+    """The stored note for an attachment that was not classified, if any."""
+    marker = f'"{filename}": '
+    if marker not in reason:
+        return None
+    return reason.split(marker, 1)[1].split(";")[0].split(" ->")[0].strip()
 
 
 def _recompute_thread_flags(session: Session) -> None:

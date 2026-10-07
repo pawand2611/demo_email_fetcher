@@ -15,9 +15,9 @@ from mailbox_viewer.attachment_store import FileSystemStore
 from mailbox_viewer.config import Settings
 from mailbox_viewer.db import init_db, make_engine, make_session_factory
 
-from .fakes import FakeDocumentModel, FakeMailClient, FakeMailServer, build_message
+from .fakes import FakeBodyModel, FakeDocumentModel, FakeMailClient, FakeMailServer, build_message, fake_classifier
 
-PDF = b"%PDF-1.4 pretend statement"
+PDF = b"%PDF-1.4 pretend invoice"
 
 
 class ApiTests(unittest.TestCase):
@@ -39,12 +39,13 @@ class ApiTests(unittest.TestCase):
         init_db(self.engine)
         self.server = FakeMailServer()
         self.model = FakeDocumentModel()
+        self.body_model = FakeBodyModel()
         services = Services(
             settings=self.settings,
             engine=self.engine,
             session_factory=make_session_factory(self.engine),
             store=FileSystemStore(self.settings.attachment_dir),
-            model=self.model,
+            classifier=fake_classifier(self.body_model, self.model),
             client_factory=lambda _s, folder: FakeMailClient(self.server, folder),
         )
         self.app = create_app(services)
@@ -59,7 +60,7 @@ class ApiTests(unittest.TestCase):
 
     def seed(self) -> None:
         self.server.add(1, build_message(subject="Invoice #42", sender="Acme <billing@acme.example>", message_id="<root@x>",
-                                         date="Mon, 01 Sep 2026 09:00:00 +0000", attachments=[("statement_aug.pdf", "application/pdf", PDF)]))
+                                         date="Mon, 01 Sep 2026 09:00:00 +0000", attachments=[("invoice_aug.pdf", "application/pdf", PDF)]))
         self.server.add(2, build_message(subject="Re: Invoice #42", sender="Ravi <ravi@example.com>", message_id="<reply@x>",
                                          in_reply_to="<root@x>", references="<root@x>", date="Mon, 01 Sep 2026 10:00:00 +0000"))
         self.server.add(3, build_message(subject="Lunch?", sender="Mia <mia@example.com>", message_id="<lunch@x>"))
@@ -75,7 +76,7 @@ class ApiTests(unittest.TestCase):
 
     def test_health_and_profile(self) -> None:
         health = self.client.get("/health").json()
-        self.assertEqual((health["status"], health["database"], health["model"]), ("ok", "ok", "fake"))
+        self.assertEqual((health["status"], health["database"], health["model"]), ("ok", "ok", "body: fake-body, attachments: fake-attachment"))
 
         [profile] = self.client.get("/profiles").json()
         self.assertEqual(profile["name"], "statement_recon")
@@ -88,7 +89,7 @@ class ApiTests(unittest.TestCase):
         job = self.run_sync()
 
         self.assertEqual(job["state"], "succeeded")
-        self.assertEqual((job["result"]["status"], job["result"]["kept"], job["result"]["payment_hits"]), ("ok", 3, 1))
+        self.assertEqual((job["result"]["status"], job["result"]["kept"], job["result"]["payment_hits"]), ("ok", 3, 2))  # root and reply both mention the invoice
         self.assertEqual(job["result"]["folders"][0]["last_seen_uid"], 3)
         self.assertTrue(job["finished_at"].endswith("Z") or "+00:00" in job["finished_at"])
 
@@ -105,20 +106,20 @@ class ApiTests(unittest.TestCase):
         detail = self.client.get(f"/threads/{invoice['id']}").json()
         self.assertEqual([m["subject"] for m in detail["messages"]], ["Re: Invoice #42", "Invoice #42"])
         root = detail["messages"][1]
-        self.assertEqual((root["doc_type"], root["confidence"], root["matched_directly"]), ("statement", 0.95, True))
+        self.assertEqual((root["doc_type"], root["confidence"], root["matched_directly"]), ("invoice", 0.95, True))
         self.assertEqual(root["decision"]["decision"], "payment")
         self.assertEqual(root["participants"][0], {"role": "from", "name": "Acme", "address": "billing@acme.example"})
         [att] = root["attachments"]
-        self.assertEqual(att["blob_key"], f"{hashlib.sha256(PDF).hexdigest()}/statement_aug.pdf")
+        self.assertEqual(att["blob_key"], f"{hashlib.sha256(PDF).hexdigest()}/invoice_aug.pdf")
 
         download = self.client.get(att["download_url"])
         self.assertEqual(download.status_code, 200)
         self.assertEqual(download.content, PDF)
         self.assertEqual(download.headers["content-type"], "application/pdf")
-        self.assertIn("statement_aug.pdf", download.headers["content-disposition"])
+        self.assertIn("invoice_aug.pdf", download.headers["content-disposition"])
 
         decision = self.client.get("/decisions/<root@x>").json()
-        self.assertEqual((decision["tier"], decision["decision"]), (1, "payment"))
+        self.assertEqual((decision["tier"], decision["decision"]), (3, "payment"))
 
     def test_second_sync_is_idempotent_and_stats_add_up(self) -> None:
         self.seed()
@@ -129,25 +130,39 @@ class ApiTests(unittest.TestCase):
         stats = self.client.get("/stats").json()
         self.assertEqual((stats["threads"], stats["emails"], stats["attachments"], stats["payment_threads"]), (2, 3, 1, 1))
         self.assertEqual((stats["judged"], stats["dropped"]), (3, 0))
-        self.assertEqual(stats["by_decision"], {"payment": 1, "none": 2})
+        self.assertEqual(stats["by_decision"], {"payment": 2, "none": 1})  # root and reply both mention the invoice
+        self.assertEqual(stats["needs_review"], 0)
         self.assertEqual(stats["sync_states"][0]["last_seen_uid"], 3)
 
         latest = self.client.get("/sync/latest").json()
         self.assertEqual(latest["id"], again["id"])
 
-    def test_reclassify_uses_the_model_and_stored_files(self) -> None:
+    def test_reclassify_runs_both_models_as_a_background_job(self) -> None:
         self.seed()
         self.run_sync()
         self.model.calls.clear()
+        self.body_model.calls.clear()
 
-        out = self.client.post("/reclassify").json()
+        started = self.client.post("/reclassify")
+        self.assertEqual(started.status_code, 202)
+        self.assertEqual(started.json()["kind"], "reclassify")
+        job = self.app.state.jobs.get(started.json()["id"])
+        self.assertTrue(job.done.wait(10))
+        out = self.client.get(f"/jobs/{job.id}").json()
 
-        # Only the stored PDF is read again. The reply loses its sync-time note
-        # "kept as part of a payment thread", which counts as one change.
-        self.assertEqual(out, {"changed": 1, "model": "fake"})
-        self.assertEqual(self.model.calls, ["statement_aug.pdf"])
-        self.assertEqual(self.client.post("/reclassify").json()["changed"], 0)
+        self.assertEqual(out["state"], "succeeded")
+        self.assertEqual(out["result"], {"changed": 0, "model": "body: fake-body, attachments: fake-attachment"})
+        self.assertEqual(self.model.calls, ["invoice_aug.pdf"])  # attachment bytes re-read from the store
+        self.assertEqual(sorted(self.body_model.calls), ["Invoice #42", "Lunch?", "Re: Invoice #42"])
         self.assertEqual(self.client.get("/stats").json()["payment_threads"], 1)
+
+    def test_disagreement_is_stored_as_review(self) -> None:
+        self.server.add(1, build_message(subject="Invoice for March", message_id="<rv@x>",
+                                         attachments=[("delivery_note.pdf", "application/pdf", PDF)]))
+        self.run_sync()
+        stats = self.client.get("/stats").json()
+        self.assertEqual((stats["needs_review"], stats["payment_threads"]), (1, 0))
+        self.assertEqual(self.client.get("/decisions/<rv@x>").json()["decision"], "review")
 
     def test_not_found_and_validation(self) -> None:
         self.assertEqual(self.client.get("/threads/999").status_code, 404)
@@ -181,10 +196,15 @@ class ApiTests(unittest.TestCase):
         self.assertIn("message_id", rows["columns"])
 
     def test_reclassify_refused_while_sync_runs(self) -> None:
+        from datetime import datetime, timezone
+
+        from api.jobs import Job
+
         jobs = self.app.state.jobs
-        jobs._running = object()  # simulate a sync in progress
+        jobs._running = Job(id="busy", kind="sync", state="running", started_at=datetime.now(timezone.utc))
         try:
             self.assertEqual(self.client.post("/reclassify").status_code, 409)
+            self.assertEqual(self.client.post("/sync").json()["id"], "busy")  # same kind: the running job is returned
         finally:
             jobs._running = None
 

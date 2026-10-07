@@ -7,7 +7,7 @@ Usage:
     python sync_mail.py                # incremental sync
     python sync_mail.py --reset-state  # forget the resume point first, then re-walk
                                        # (still adds no duplicate rows)
-    python sync_mail.py --reclassify   # re-run the document model over the cache
+    python sync_mail.py --reclassify   # re-run both models over the cache
                                        # only; no mail-server contact
 
 This is a backend-side maintenance tool; the Streamlit frontend uses the API.
@@ -23,7 +23,7 @@ from mailbox_viewer import repository as repo
 from mailbox_viewer.attachment_store import build_store
 from mailbox_viewer.config import ConfigError, load_settings
 from mailbox_viewer.db import init_db, make_engine, make_session_factory
-from mailbox_viewer.document_model import load_model
+from mailbox_viewer.document_model import load_classifier
 from mailbox_viewer.sync import run_sync
 
 
@@ -42,14 +42,17 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Config error: {exc}", file=sys.stderr)
         return 2
 
-    try:
-        model = load_model(settings)
-    except ConfigError as exc:
-        print(f"Config error: {exc}", file=sys.stderr)
-        return 2
+    if args.redecide:
+        # Re-deciding only re-applies the rule to stored predictions: no models needed.
+        from mailbox_viewer.classification_graph import EmailClassifier
+        from mailbox_viewer.classifier import NoBodyModel, NoModel
+
+        classifier = EmailClassifier(NoBodyModel(), NoModel(), settings.model_min_confidence, settings.body_min_confidence)
+    else:
+        classifier = load_classifier(settings)
     store = build_store(settings)
     print(f"Attachments  : {store.describe()}")
-    print(f"Model        : {model.name}")
+    print(f"Models       : {classifier.name}")
     print(f"Folders      : {', '.join(settings.imap_folders)}")
     print(f"Keep policy  : {'payment documents and payment threads only' if settings.store_only_payment else 'every message'}")
 
@@ -57,12 +60,23 @@ def main(argv: list[str] | None = None) -> int:
     init_db(engine, settings.db_schema)
     session_factory = make_session_factory(engine)
 
-    if args.reclassify:
+    if args.redecide:
         with session_factory() as session, session.begin():
-            changed = repo.reclassify_all(session, store, model, settings.model_min_confidence)
+            changed = repo.redecide_all(session, classifier)
             by_doc = repo.count_by_doc_type(session)
             by_decision = repo.count_by_decision(session)
-        print(f"Model {model.name} re-applied to cached mail: {changed} email(s) changed")
+        print(f"Decision rule re-applied to stored predictions (body bar {settings.body_min_confidence:.2f}, attachment bar {settings.model_min_confidence:.2f}): {changed} email(s) changed")
+        _print_counts("doc_type", by_doc)
+        _print_counts("decision", by_decision)
+        engine.dispose()
+        return 0
+
+    if args.reclassify:
+        with session_factory() as session, session.begin():
+            changed = repo.reclassify_all(session, store, classifier)
+            by_doc = repo.count_by_doc_type(session)
+            by_decision = repo.count_by_decision(session)
+        print(f"Models ({classifier.name}) re-applied to cached mail: {changed} email(s) changed")
         _print_counts("doc_type", by_doc)
         _print_counts("decision", by_decision)
         engine.dispose()
@@ -74,7 +88,7 @@ def main(argv: list[str] | None = None) -> int:
         print("Sync state cleared for: " + ", ".join(removed) if removed else "No sync state to clear")
 
     before = _counts(session_factory)
-    result = run_sync(settings, session_factory, store=store, model=model)
+    result = run_sync(settings, session_factory, store=store, classifier=classifier)
     after = _counts(session_factory)
 
     print()
@@ -125,7 +139,8 @@ def _print_counts(title: str, counts: dict[str, int]) -> None:
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--reset-state", action="store_true", help="clear the stored resume point so the run re-walks the folder")
-    parser.add_argument("--reclassify", action="store_true", help="re-run the document model over the cache and exit; does not contact the server")
+    parser.add_argument("--redecide", action="store_true", help="re-apply the decision rule to stored predictions; no models, no mail server")
+    parser.add_argument("--reclassify", action="store_true", help="re-run both models over the cache and exit; does not contact the server")
     return parser.parse_args(argv)
 
 

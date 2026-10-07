@@ -37,10 +37,13 @@ class Settings:
     store_only_payment: bool = False
     # Every folder to sync, each with its own bookmark. Defaults to (imap_folder,).
     imap_folders: tuple[str, ...] = ()
-    # Trained document model (LayoutLMv3). Empty = no model; attachments stay unclassified.
-    model_path: str | None = None
-    # A payment label counts only when the model's score reaches this value.
+    # Trained models, local folders. Missing folder = that model is skipped.
+    attachment_model_dir: str | None = "models/layoutlmv3_invoice"
+    body_model_dir: str | None = "models/laya"
+    # Attachment model (LayoutLMv3): an invoice counts from this score.
     model_min_confidence: float = 0.5
+    # Body model (Laya): a statement / invoice / receipt counts as payment only from this score.
+    body_min_confidence: float = 0.9
     # Name of the business purpose this deployment serves.
     profile_name: str = "statement_recon"
 
@@ -60,6 +63,9 @@ _DEFAULTS = {
     "ATTACHMENT_DIR": "data/attachments",
     "STORE_ONLY_PAYMENT": "false",
     "MODEL_MIN_CONFIDENCE": "0.5",
+    "BODY_MIN_CONFIDENCE": "0.9",
+    "ATTACHMENT_MODEL_DIR": "models/layoutlmv3_invoice",
+    "BODY_MODEL_DIR": "models/laya",
     "PROFILE_NAME": "statement_recon",
 }
 
@@ -101,8 +107,10 @@ def load_settings(env_file: str | os.PathLike[str] | None = None) -> Settings:
         db_schema=db_schema,
         store_only_payment=_get_bool("STORE_ONLY_PAYMENT"),
         imap_folders=folders,
-        model_path=_get("MODEL_PATH") or None,
+        attachment_model_dir=_get("ATTACHMENT_MODEL_DIR") or None,
+        body_model_dir=_get("BODY_MODEL_DIR") or None,
         model_min_confidence=_get_fraction("MODEL_MIN_CONFIDENCE"),
+        body_min_confidence=_get_fraction("BODY_MIN_CONFIDENCE"),
         profile_name=_get("PROFILE_NAME") or "statement_recon",
     )
 
