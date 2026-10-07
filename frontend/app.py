@@ -146,7 +146,7 @@ def render_thread_list(threads: list[dict], total: int) -> int | None:
         on_select="rerun",
         selection_mode="single-row",
         column_config={
-            "Last message": st.column_config.DatetimeColumn(format="DD MMM YYYY, HH:mm", width="small"),
+            "Last message": st.column_config.DatetimeColumn("Last message (IST)", format="DD MMM YYYY, HH:mm", width="small"),
             "From": st.column_config.TextColumn(width="medium"),
             "Subject": st.column_config.TextColumn(width="large"),
             "Msgs": st.column_config.NumberColumn("💬", width="small", help="messages in the thread"),
@@ -266,7 +266,7 @@ def _display(p: dict) -> str:
 
 
 def _fmt(value: datetime | None) -> str:
-    return value.strftime("%d %b %Y, %H:%M") if value else "unknown"
+    return value.strftime("%d %b %Y, %H:%M IST") if value else "unknown"
 
 
 def _human_size(size: int) -> str:

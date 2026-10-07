@@ -80,7 +80,8 @@ Pages:
 | `GET /schema`, `GET /schema/ddl` | data model as JSON, DDL as text |
 | `GET /tables`, `GET /tables/{name}/rows` | raw table browsing |
 
-All timestamps are UTC (ISO 8601 with `Z`).
+All timestamps are shown in IST, Indian Standard Time (ISO 8601 with `+05:30`).
+The database stores UTC; conversion happens on the way out (`mailbox_viewer/timeutil.py`).
 
 ## Database: SQLite or PostgreSQL
 

@@ -1,4 +1,4 @@
-"""Response models of the HTTP API. All datetimes are UTC with an offset."""
+"""Response models of the HTTP API. All datetimes are in IST (+05:30), with the offset."""
 
 from __future__ import annotations
 

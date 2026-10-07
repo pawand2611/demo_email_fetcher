@@ -18,6 +18,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from mailbox_viewer import repository as repo
 from mailbox_viewer.config import ConfigError, load_settings
 from mailbox_viewer.db import init_db, make_engine, make_session_factory
+from mailbox_viewer.timeutil import fmt_ist
 
 
 def main() -> int:
@@ -54,7 +55,7 @@ def main() -> int:
             states = {f: repo.get_sync_state(session, f) for f in settings.imap_folders}
         for folder, state in states.items():
             if state and state.last_sync_at:
-                print(f"Last sync    : {folder!r} {state.last_sync_at:%Y-%m-%d %H:%M} UTC, last seen UID {state.last_seen_uid}")
+                print(f"Last sync    : {folder!r} {fmt_ist(state.last_sync_at)}, last seen UID {state.last_seen_uid}")
             else:
                 print(f"Last sync    : {folder!r} never (run `python sync_mail.py` to fill the cache)")
     except SQLAlchemyError as exc:

@@ -93,7 +93,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(job["state"], "succeeded")
         self.assertEqual((job["result"]["status"], job["result"]["kept"], job["result"]["payment_hits"]), ("ok", 3, 1))  # the reply inherits the thread's payment status
         self.assertEqual(job["result"]["folders"][0]["last_seen_uid"], 3)
-        self.assertTrue(job["finished_at"].endswith("Z") or "+00:00" in job["finished_at"])
+        self.assertTrue(job["finished_at"].endswith("+05:30"))
 
         threads = self.client.get("/threads").json()
         # newest conversation first: the invoice reply (10:00) is newer than "Lunch?" (09:30)
@@ -103,7 +103,7 @@ class ApiTests(unittest.TestCase):
 
         invoice = next(t for t in threads if t["subject"] == "Invoice #42")
         self.assertEqual((invoice["message_count"], invoice["has_payment"], invoice["attachment_count"]), (2, True, 1))
-        self.assertEqual(invoice["last_message_at"], "2026-09-01T10:00:00Z")  # UTC with an explicit offset
+        self.assertEqual(invoice["last_message_at"], "2026-09-01T15:30:00+05:30")  # 10:00 UTC shown in IST
 
         detail = self.client.get(f"/threads/{invoice['id']}").json()
         self.assertEqual([m["subject"] for m in detail["messages"]], ["Re: Invoice #42", "Invoice #42"])
@@ -166,6 +166,14 @@ class ApiTests(unittest.TestCase):
         stats = self.client.get("/stats").json()
         self.assertEqual((stats["needs_review"], stats["payment_threads"]), (1, 0))
         self.assertEqual(self.client.get("/decisions/<rv@x>").json()["decision"], "review")
+
+    def test_table_rows_show_timestamps_in_ist(self) -> None:
+        self.seed()
+        self.run_sync()
+        rows = self.client.get("/tables/emails/rows", params={"order_by": "received_at", "descending": False}).json()["rows"]
+        self.assertEqual(rows[0]["received_at"], "2026-09-01T14:30:00+05:30")  # 09:00 UTC
+        state = self.client.get("/stats").json()["sync_states"][0]
+        self.assertTrue(state["last_sync_at"].endswith("+05:30"))
 
     def test_not_found_and_validation(self) -> None:
         self.assertEqual(self.client.get("/threads/999").status_code, 404)

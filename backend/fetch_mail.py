@@ -17,6 +17,7 @@ import sys
 from mailbox_viewer.config import ConfigError, load_settings
 from mailbox_viewer.mail_client import MailClient, MailClientError, MailConnectionLost
 from mailbox_viewer.mail_parser import ParsedEmail, parse_message
+from mailbox_viewer.timeutil import fmt_ist
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -78,7 +79,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 
 def _print_email(mail: ParsedEmail, *, show_body: bool) -> None:
-    received = mail.received_at.strftime("%Y-%m-%d %H:%M UTC") if mail.received_at else "unknown date"
+    received = fmt_ist(mail.received_at) if mail.received_at else "unknown date"
     sender = f"{mail.sender_name} <{mail.sender_email}>" if mail.sender_name else mail.sender_email
     print(f"[UID {mail.imap_uid}] {received} | From: {sender or '(none)'}")
     print(f"    Subject: {mail.subject or '(no subject)'}")
