@@ -29,7 +29,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from . import repository as repo
 from .attachment_store import AttachmentStoreError, FileSystemStore, build_store
 from .classification_graph import EmailClassifier
-from .classifier import Decision, EmailInput, inherited_decision
+from .classifier import Decision, EmailInput
 from .config import Settings
 from .document_model import load_classifier
 from .mail_client import MailClient, MailClientError, MailConnectionLost
@@ -258,11 +258,15 @@ class _Processor:
             in_payment_thread = thread_id is not None and repo.thread_has_payment(session, thread_id)
 
         # Step 4: classify; every message gets a decision line. A later email of a
-        # thread already classified as payment inherits it without running the models.
-        decision = inherited_decision(len(mail.attachments)) if in_payment_thread else self._classify(mail)
+        # thread already classified as payment inherits it (Laya skipped,
+        # attachments still labelled by LayoutLMv3).
+        email = EmailInput.from_parsed(mail)
+        decision = self.classifier.inherit(email) if in_payment_thread else self._classify(mail)
 
         # Step 5: keep?
-        keep = decision.is_payment or in_payment_thread or not self.store_only_payment
+        # Review emails are kept too: dropped ones are never fetched again, so a
+        # human could not check them later.
+        keep = decision.is_payment or decision.needs_review or in_payment_thread or not self.store_only_payment
         if not keep:
             with self.session_factory() as session, session.begin():
                 repo.log_decision(session, mail.message_id, decision)

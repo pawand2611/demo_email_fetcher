@@ -134,12 +134,13 @@ backend, so neither the API nor the mailbox is needed).
 default `INBOX,[Gmail]/Sent Mail` makes threads complete with your own
 replies, and messages from all folders land in the same threads.
 
-By default (`STORE_ONLY_PAYMENT=false`) every fetched message is stored.
-With `STORE_ONLY_PAYMENT=true` every message is still judged and logged in
-`decision_log`, but only payment documents (statements, invoices, receipts)
-and the threads they belong to are stored; when a thread turns into a payment
-thread, its earlier messages are backfilled from the mailbox. The sidebar
-shows how many messages were judged versus stored.
+With `STORE_ONLY_PAYMENT=true` (the setting in use since 2026-10-07) every
+fetched message is judged and logged in `decision_log`, but only
+payment-related mail is stored: payment emails, later emails of a payment
+thread, earlier emails of a thread that turns payment (backfilled from the
+mailbox), and `review` emails so a human can check them. With `false` every
+message is stored. The sidebar shows how many messages were judged versus
+stored. Emails stored before the switch stay in the database.
 
 ## How the sync stays idempotent and incremental
 
@@ -181,7 +182,7 @@ Decision rule:
 | Readable attachment, LayoutLMv3 above 0.8 says **not invoice** | not payment, on the attachment alone; Laya not run |
 | Readable attachment, LayoutLMv3 at or below 0.8 | Laya is consulted: statement / invoice / receipt at ≥ `BODY_MIN_CONFIDENCE` (0.7) is payment; 0.5 to 0.7, or a weak invoice call Laya does not support, is review; otherwise none |
 | No readable attachment (none, or only CSV and similar) | Laya alone, same 0.7 bar and review band |
-| An earlier email in the same thread is payment | payment, inherited; no model is run |
+| An earlier email in the same thread is payment | payment, inherited; Laya not run, LayoutLMv3 still labels any attachments |
 
 Note that a bank statement attached as a PDF is "not invoice" to LayoutLMv3,
 so above 0.8 it is decided as not payment even if Laya reads the body as a

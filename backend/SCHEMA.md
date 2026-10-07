@@ -121,8 +121,8 @@ email on its own and Laya is skipped. Otherwise Laya (zero-shot) reads the
 body and counts as payment at 0.7 or more (`BODY_MIN_CONFIDENCE`), with 0.5
 to 0.7, or a weak invoice call Laya does not support, going to `review`.
 Without a readable attachment Laya decides alone. Once an email of a thread
-is payment, later emails of that thread inherit it without running the
-models (`matched_directly` false, reason "part of a thread already classified
+is payment, later emails of that thread inherit it without running Laya;
+LayoutLMv3 still labels their attachments (`matched_directly` false, reason "part of a thread already classified
 as payment"). Re-classify and re-decide replay emails oldest first so the
 thread rule sees earlier emails first. See the README table.
 
@@ -159,3 +159,6 @@ store refuses any key that could escape its root.
 - 2026-10-07: rule set by the user: attachment model decides alone above
   0.8, otherwise Laya is consulted (0.7 bar); without attachments Laya
   decides; later emails of a payment thread inherit payment.
+- 2026-10-07: inherited emails get their attachments labelled by LayoutLMv3.
+  Storage switched to payment-related mail only (`STORE_ONLY_PAYMENT=true`);
+  review emails are kept so they can be checked.
