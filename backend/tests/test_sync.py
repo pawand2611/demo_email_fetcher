@@ -16,6 +16,7 @@ from mailbox_viewer import repository as repo
 from mailbox_viewer.attachment_store import FileSystemStore
 from mailbox_viewer.config import Settings
 from mailbox_viewer.db import init_db, make_engine, make_session_factory
+from mailbox_viewer.classifier import Prediction
 from mailbox_viewer.mail_client import MailClientError, MailConnectionLost
 from mailbox_viewer.models import Attachment, DecisionLog, Email, EmailParticipant, Thread
 from mailbox_viewer.sync import STATUS_FAILED, STATUS_OK, STATUS_PARTIAL, run_sync
@@ -501,7 +502,7 @@ class KeepOnlyPaymentFlowTests(SyncTests):
         result = self.sync()
 
         self.assertEqual((result.kept, result.payment_hits, result.dropped), (1, 0, 0))
-        self.assertEqual((self.classifier.body_model.calls, self.classifier.document_model.calls), ([], []))  # models not run
+        self.assertEqual((self.classifier.body_model.calls, self.classifier.document_model.calls), ([], []))  # no attachment: no model run
         with self.factory() as session:
             thread = repo.list_threads(session)[0]
             self.assertEqual((thread.message_count, thread.has_payment), (2, True))
@@ -509,6 +510,33 @@ class KeepOnlyPaymentFlowTests(SyncTests):
             reply = session.scalar(select(Email).where(Email.message_id == "<reply@x>"))
         self.assertEqual((log.decision, reply.matched_directly), ("payment", False))
         self.assertIn("thread already classified as payment", log.reason)
+
+    def test_inherited_reply_gets_its_attachment_labelled(self) -> None:
+        self.server.add(1, build_message(subject="Your account statement", message_id="<s0@x>"))  # Laya: statement -> payment
+        self.sync()
+        self.server.add(2, build_message(subject="Re: statement", message_id="<s1@x>", in_reply_to="<s0@x>", references="<s0@x>",
+                                         attachments=[("invoice_77.pdf", "application/pdf", PDF)]))
+        self.classifier.body_model.calls.clear()
+
+        self.sync()
+
+        self.assertEqual(self.classifier.body_model.calls, [])  # Laya skipped for the inherited reply
+        with self.factory() as session:
+            reply = session.scalar(select(Email).where(Email.message_id == "<s1@x>"))
+            att = session.scalar(select(Attachment).where(Attachment.email_id == reply.id))
+        self.assertEqual((reply.doc_type, reply.matched_directly), ("invoice", False))
+        self.assertEqual((att.doc_type, att.confidence), ("invoice", 0.95))
+
+    def test_payment_only_mode_keeps_review_emails(self) -> None:
+        self.classifier.body_model.overrides["Maybe a bill"] = Prediction("invoice", 0.6)  # 0.5-0.7 -> review
+        self.server.add(1, build_message(subject="Maybe a bill", message_id="<mb@x>"))
+
+        result = self.sync()
+
+        self.assertEqual((result.kept, result.dropped), (1, 0))
+        with self.factory() as session:
+            self.assertEqual(session.get(DecisionLog, "<mb@x>").decision, "review")
+            self.assertIsNotNone(session.scalar(select(Email).where(Email.message_id == "<mb@x>")))
 
     def test_replay_applies_the_thread_rule_oldest_first(self) -> None:
         self.server.add(1, build_message(subject="Plan", message_id="<p0@x>", date="Mon, 01 Sep 2026 09:00:00 +0000"))

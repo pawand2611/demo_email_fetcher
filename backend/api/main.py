@@ -34,6 +34,7 @@ from mailbox_viewer.document_model import load_classifier
 from mailbox_viewer.mail_client import MailClient
 from mailbox_viewer.models import Base
 from mailbox_viewer.sync import ClientFactory, SyncResult, run_sync
+from mailbox_viewer.timeutil import to_ist
 
 from . import schemas as s
 from .jobs import KIND_RECLASSIFY, KIND_REDECIDE, KIND_SYNC, Job, Jobs
@@ -154,7 +155,7 @@ def create_app(services: Services | None = None) -> FastAPI:
                         folder_name=f,
                         uid_validity=st_.uid_validity if st_ else None,
                         last_seen_uid=st_.last_seen_uid if st_ else 0,
-                        last_sync_at=_utc(st_.last_sync_at) if st_ else None,
+                        last_sync_at=_ist(st_.last_sync_at) if st_ else None,
                     )
                     for f, st_ in zip(svc.settings.imap_folders, states)
                 ],
@@ -289,7 +290,10 @@ def create_app(services: Services | None = None) -> FastAPI:
                 stmt = stmt.order_by(*(c.desc() if descending else c.asc() for c in pk))
         with svc.session_factory() as session:
             total = session.execute(select(func.count()).select_from(table)).scalar() or 0
-            rows = [dict(r._mapping) for r in session.execute(stmt)]
+            rows = [
+                {k: (_ist(v) if isinstance(v, datetime) else v) for k, v in r._mapping.items()}
+                for r in session.execute(stmt)
+            ]
         return s.TableRowsOut(name=name, total=total, columns=[c.name for c in table.columns], rows=jsonable_encoder(rows))
 
     return app
@@ -298,11 +302,9 @@ def create_app(services: Services | None = None) -> FastAPI:
 # -- mapping helpers ----------------------------------------------------------------------
 
 
-def _utc(value: datetime | None) -> datetime | None:
-    """Stored datetimes are naive UTC; give them an explicit offset on the wire."""
-    if value is None:
-        return None
-    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+def _ist(value: datetime | None) -> datetime | None:
+    """Stored datetimes are naive UTC; every response shows them in IST (+05:30)."""
+    return to_ist(value)
 
 
 def _short(exc: BaseException) -> str:
@@ -316,7 +318,7 @@ def _thread_out(t: repo.ThreadSummary) -> s.ThreadOut:
         conversation_key=t.conversation_key,
         subject=t.subject,
         message_count=t.message_count,
-        last_message_at=_utc(t.last_message_at),
+        last_message_at=_ist(t.last_message_at),
         has_payment=t.has_payment,
         participants=t.participants,
         attachment_count=t.attachment_count,
@@ -330,7 +332,7 @@ def _decision_out(d: repo.DecisionInfo) -> s.DecisionOut:
         decision=d.decision,
         confidence=d.confidence,
         reason=d.reason,
-        decided_at=_utc(d.decided_at),
+        decided_at=_ist(d.decided_at),
     )
 
 
@@ -340,7 +342,7 @@ def _message_out(d: repo.EmailDetail, decision: repo.DecisionInfo | None) -> s.M
         message_id=d.message_id,
         subject=d.subject,
         body_text=d.body_text,
-        received_at=_utc(d.received_at),
+        received_at=_ist(d.received_at),
         in_reply_to=d.in_reply_to,
         references_header=d.references_header,
         has_attachments=d.has_attachments,
@@ -375,8 +377,8 @@ def _job_out(job: Job) -> s.JobOut:
         id=job.id,
         kind=job.kind,
         state=job.state,
-        started_at=job.started_at,
-        finished_at=job.finished_at,
+        started_at=_ist(job.started_at),
+        finished_at=_ist(job.finished_at),
         result=result,
         error=job.error,
     )

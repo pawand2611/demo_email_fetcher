@@ -8,13 +8,15 @@ where the backend runs.
 from __future__ import annotations
 
 import os
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
 from dotenv import load_dotenv
 
 DEFAULT_API_URL = "http://127.0.0.1:8000"
+# All timestamps are shown in Indian Standard Time (no daylight saving, fixed +05:30).
+IST = timezone(timedelta(hours=5, minutes=30), "IST")
 START_HINT = "cd backend; python -m uvicorn api.main:create_app --factory --host 127.0.0.1 --port 8000"
 
 
@@ -117,7 +119,10 @@ class ApiClient:
 
 
 def parse_time(value: str | None) -> datetime | None:
-    """API timestamps are ISO 8601 with an offset; return local naive time for display."""
+    """API timestamps are ISO 8601 with an offset; return naive IST for display."""
     if not value:
         return None
-    return datetime.fromisoformat(value).astimezone().replace(tzinfo=None)
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:  # raw table values carry no offset only if stored naive: treat as UTC
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(IST).replace(tzinfo=None)

@@ -180,8 +180,20 @@ class CombineRuleTests(unittest.TestCase):
         d = inherited_decision(2)
         self.assertTrue(d.is_payment and d.inherited)
         self.assertFalse(d.matched_directly)
-        self.assertEqual(len(d.attachments), 2)
+        self.assertEqual((len(d.attachments), d.doc_type, d.tier), (2, None, TIER_NONE))
         self.assertIn("thread already classified as payment", d.reason)
+
+    def test_inherited_decision_carries_attachment_labels(self) -> None:
+        d = inherited_decision([att("invoice", 0.97, "inv.pdf"), att("not_invoice", 0.9, "terms.pdf")])
+        self.assertEqual((d.decision, d.doc_type, d.confidence, d.tier), (DECISION_PAYMENT, "invoice", 0.97, TIER_ATTACHMENT))
+        self.assertIn('attachments labelled: "inv.pdf": invoice (0.97), "terms.pdf": not_invoice (0.90)', d.reason)
+        self.assertFalse(d.matched_directly)
+
+    def test_classifier_inherit_runs_only_the_attachment_model(self) -> None:
+        body_model, doc_model = FakeBodyModel(), FakeDocumentModel()
+        d = fake_classifier(body_model, doc_model).inherit(EmailInput("Re: x", "thanks", (pdf("invoice_7.pdf"),)))
+        self.assertEqual((d.decision, d.doc_type, d.inherited), (DECISION_PAYMENT, "invoice", True))
+        self.assertEqual((body_model.calls, doc_model.calls), ([], ["invoice_7.pdf"]))
 
     def test_with_note(self) -> None:
         d = combine(body("other", 0.8), []).with_note("backfilled into a payment thread")

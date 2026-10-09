@@ -34,6 +34,7 @@ from .classifier import (
     classify_attachments,
     classify_body,
     combine,
+    inherited_decision,
 )
 
 
@@ -78,6 +79,14 @@ class EmailClassifier:
 
     def classify(self, email: EmailInput) -> Decision:
         return self._graph.invoke({"email": email})["decision"]
+
+    def inherit(self, email: EmailInput) -> Decision:
+        """Thread rule: payment by inheritance. Laya is skipped; LayoutLMv3
+        still labels any attachments so an invoice file is recognised."""
+        if not email.attachments:
+            return inherited_decision(0)
+        labels = self._on_model_thread(classify_attachments, email.attachments, self.document_model)
+        return inherited_decision(labels)
 
     def combine(self, body: BodyDecision, attachments: Sequence[AttachmentDecision]) -> Decision:
         """The decision rule on its own, for re-deciding from stored predictions."""

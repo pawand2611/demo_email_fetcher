@@ -20,8 +20,9 @@ Decision rule (the user's, 2026-10-07; scores 0..1):
 2. **No readable attachment** (none, or only CSV and similar): Laya alone,
    same bars.
 3. **Thread rule** (applied by the sync, not here): once an email in a thread
-   is classified payment, later emails in that thread are kept as payment
-   without running the models (:func:`inherited_decision`).
+   is classified payment, later emails in that thread are payment too
+   (:func:`inherited_decision`). Laya is not run for them; LayoutLMv3 still
+   labels their attachments so an invoice file is recognised as one.
 
 ``tier`` records which models decided: 0 none, 1 attachment model only,
 2 body model only, 3 both.
@@ -332,16 +333,27 @@ def combine(
     return decide(DECISION_NONE, "other", best.confidence, tier, "no payment evidence")
 
 
-def inherited_decision(n_attachments: int) -> Decision:
+def inherited_decision(attachments: Sequence[AttachmentDecision] | int = ()) -> Decision:
     """Rule 3: the email belongs to a thread already classified as payment, so
-    it is kept as payment without running either model."""
+    it is payment too. ``attachments`` are LayoutLMv3's labels for its files
+    (labelling only; they do not change the decision), or a count when the
+    files were not labelled."""
+    if isinstance(attachments, int):
+        attachments = tuple(AttachmentDecision(None, None) for _ in range(attachments))
+    attachments = tuple(attachments)
+    labelled = [a for a in attachments if a.doc_type is not None and a.confidence is not None]
+    reason = "part of a thread already classified as payment; body model not run"
+    if labelled:
+        reason += "; attachments labelled: " + ", ".join(f'"{a.filename}": {a.doc_type} ({a.confidence:.2f})' for a in labelled)
+    invoices = [a for a in labelled if a.doc_type == ATTACHMENT_INVOICE]
+    best = max(invoices, key=lambda a: a.confidence) if invoices else None
     return Decision(
-        None,
-        TIER_NONE,
-        None,
+        ATTACHMENT_INVOICE if best else None,
+        TIER_ATTACHMENT if labelled else TIER_NONE,
+        best.confidence if best else None,
         DECISION_PAYMENT,
-        "part of a thread already classified as payment; models not run",
-        tuple(AttachmentDecision(None, None) for _ in range(n_attachments)),
+        reason,
+        attachments,
         inherited=True,
     )
 

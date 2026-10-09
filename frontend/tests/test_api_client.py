@@ -80,6 +80,8 @@ class ApiClientTests(unittest.TestCase):
 
     def test_parse_time_accepts_z_and_offsets(self) -> None:
         self.assertEqual(parse_time("2026-10-07T09:00:00Z"), parse_time("2026-10-07T09:00:00+00:00"))
+        self.assertEqual(parse_time("2026-10-07T09:00:00Z").strftime("%H:%M"), "14:30")  # shown in IST
+        self.assertEqual(parse_time("2026-10-07T14:30:00+05:30").strftime("%H:%M"), "14:30")
         self.assertIsNone(parse_time(None))
 
 

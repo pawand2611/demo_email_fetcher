@@ -272,15 +272,21 @@ def reclassify_all(
     attachment bytes from the file store; the mail server is never contacted.
     Writes only rows that change. Returns how many emails changed."""
 
-    def run(row: Email) -> Decision:
+    def email_of(row: Email) -> EmailInput:
         inputs = tuple(
             AttachmentInput(a.filename, a.content_type, store.get(a.blob_key) if store.exists(a.blob_key) else None)
             for a in row.attachments
         )
-        return classifier.classify(EmailInput(row.subject, row.body_text, inputs))
+        return EmailInput(row.subject, row.body_text, inputs)
+
+    def run(row: Email) -> Decision:
+        return classifier.classify(email_of(row))
+
+    def inherit(row: Email) -> Decision:
+        return classifier.inherit(email_of(row))
 
     where = Email.has_attachments.is_(True) if only_with_attachments else None  # e.g. after installing OCR
-    return _replay(session, run, where, progress_label="reclassify")
+    return _replay(session, run, where, progress_label="reclassify", inherit=inherit)
 
 
 def redecide_all(session: Session, classifier: EmailClassifier) -> int:
@@ -299,10 +305,13 @@ def redecide_all(session: Session, classifier: EmailClassifier) -> int:
         )
         return classifier.combine(body, attachments)
 
-    return _replay(session, run, None, progress_label=None, run_gets_log=True)
+    def inherit(row: Email) -> Decision:  # stored attachment labels; no model is run
+        return inherited_decision(tuple(AttachmentDecision(a.doc_type, a.confidence, a.filename) for a in row.attachments))
+
+    return _replay(session, run, None, progress_label=None, run_gets_log=True, inherit=inherit)
 
 
-def _replay(session: Session, run, where, progress_label: str | None, run_gets_log: bool = False) -> int:
+def _replay(session: Session, run, where, progress_label: str | None, run_gets_log: bool = False, inherit=None) -> int:
     """Decide emails oldest first so the thread rule sees earlier emails first."""
     stmt = select(Email).options(selectinload(Email.attachments))
     if where is not None:
@@ -329,7 +338,7 @@ def _replay(session: Session, run, where, progress_label: str | None, run_gets_l
         first = min((k for k in (inside_first.get(row.thread_id), outside_first.get(row.thread_id)) if k is not None), default=None)
         log = logs.get(row.message_id)
         if first is not None and first < key:
-            decision = inherited_decision(len(row.attachments))
+            decision = inherit(row) if inherit else inherited_decision(len(row.attachments))
         else:
             decision = run(row, log) if run_gets_log else run(row)
             if log and log.reason and _BACKFILL_NOTE in log.reason and not decision.is_payment:
