@@ -235,6 +235,8 @@ def _extract_attachments(msg: EmailMessage) -> list[ParsedAttachment]:
             continue
         if not isinstance(data, bytes) or not data:
             continue
+        if _is_small_inline_image(part, data):
+            continue
         content_type = part.get_content_type()
         filename = _safe_filename(_get_filename(part), content_type, len(attachments) + 1)
         attachments.append(
@@ -249,18 +251,26 @@ def _extract_attachments(msg: EmailMessage) -> list[ParsedAttachment]:
     return attachments
 
 
+# Inline images below this size are signature logos and icons. Larger ones are
+# real content: a photo of an invoice added from a phone arrives inline with a
+# Content-ID, exactly like a logo, and must reach the attachment model.
+MIN_INLINE_IMAGE_BYTES = 20_000
+
+
 def _looks_like_attachment(part: Message) -> bool:
-    disposition = part.get_content_disposition()
-    if disposition == "attachment":
+    if part.get_content_disposition() == "attachment":
         return True
-    filename = _get_filename(part)
-    if not filename:
-        return False
-    # Inline images referenced from the HTML body (signature logos and the
-    # like) are rendering assets, not attachments the user cares about.
-    if disposition == "inline" and part.get_content_maintype() == "image" and part.get("Content-ID"):
-        return False
-    return True
+    return bool(_get_filename(part))
+
+
+def _is_small_inline_image(part: Message, data: bytes) -> bool:
+    """An inline image referenced from the HTML body that is too small to be a document."""
+    return (
+        part.get_content_disposition() == "inline"
+        and part.get_content_maintype() == "image"
+        and bool(part.get("Content-ID"))
+        and len(data) < MIN_INLINE_IMAGE_BYTES
+    )
 
 
 def _get_filename(part: Message) -> str:

@@ -5,14 +5,8 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 
-from api_client import ApiClient, ApiError
-
-st.set_page_config(page_title="Tables", page_icon="📋", layout="wide")
-
-
-@st.cache_resource(show_spinner=False)
-def get_api() -> ApiClient:
-    return ApiClient()
+from api_client import ApiError
+from ui import get_api
 
 
 def main() -> None:
