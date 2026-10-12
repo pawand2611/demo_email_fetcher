@@ -9,9 +9,8 @@ from __future__ import annotations
 
 import streamlit as st
 
-from api_client import ApiClient, ApiError
-
-st.set_page_config(page_title="Data model", page_icon="🗂️", layout="wide")
+from api_client import ApiError
+from ui import get_api
 
 STYLE = {
     "threads": ("#1f1f1f", "#ffffff"),
@@ -28,13 +27,8 @@ OWNERSHIP = {
     "email_participants": "One row per person per role, so To and Cc lists that change across a thread stay clean.",
     "attachments": "Tied to the message it arrived on. `blob_key` is a reference only; the file lives in the store.",
     "sync_state": "The bookmark, one row per folder: where the next incremental sync resumes.",
-    "decision_log": "The audit trail: what the document model decided, and why.",
+    "decision_log": "The audit trail: every email judged, kept or not, with the decision and why.",
 }
-
-
-@st.cache_resource(show_spinner=False)
-def get_api() -> ApiClient:
-    return ApiClient()
 
 
 def main() -> None:

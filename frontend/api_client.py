@@ -55,7 +55,7 @@ class ApiClient:
         return self._json("POST", "/sync")
 
     def job(self, job_id: str) -> dict[str, Any]:
-        """State of a background job (sync or reclassify)."""
+        """State of a background job (sync, reclassify or redecide)."""
         return self._json("GET", f"/jobs/{job_id}")
 
     def sync_job(self, job_id: str) -> dict[str, Any]:
@@ -64,9 +64,14 @@ class ApiClient:
     def latest_sync(self) -> dict[str, Any] | None:
         return self._json("GET", "/sync/latest")
 
-    def reclassify(self) -> dict[str, Any]:
-        """Start re-classifying all cached mail in the background; returns the job."""
-        return self._json("POST", "/reclassify")
+    def reclassify(self, *, only_with_attachments: bool = False) -> dict[str, Any]:
+        """Start re-running the models over cached mail in the background; returns the job."""
+        params = {"only_with_attachments": True} if only_with_attachments else None
+        return self._json("POST", "/reclassify", params=params)
+
+    def redecide(self) -> dict[str, Any]:
+        """Start re-applying the decision rules to stored scores (no models); returns the job."""
+        return self._json("POST", "/redecide")
 
     # -- mail -----------------------------------------------------------------------
 

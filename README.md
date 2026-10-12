@@ -50,17 +50,27 @@ cd frontend
 The backend has no login (Task 1 forbids it), so it must stay bound to
 `127.0.0.1`. Interactive API docs: http://127.0.0.1:8000/docs.
 
-Pages:
+Pages (`app.py` sets up the navigation; each page is in `frontend/views/`):
 
-- **Inbox** (`app.py`): one row per conversation with sender(s), message
-  count, attachment count and a payment flag. Select a row to read every
-  message in the thread, its participants, attachments with download
-  buttons, and the model's decision. **Refresh** starts a background sync on
-  the backend and shows a spinner until it finishes. **Re-run classifier**
-  re-applies the document model to cached mail without contacting the server.
+- **Overview**: headline numbers, how emails were decided, document types,
+  the latest payment conversations (with **Open**), the rules in force and
+  the sync status per folder.
+- **Inbox**: one row per conversation with sender(s), message count,
+  attachment count and a payment flag. Select a row to read every message,
+  its participants, attachments with download buttons, its decision and
+  which of the three checks made it.
+- **Decision log**: every email judged, kept or not, filterable by decision,
+  check and stored / not stored.
+- **How it decides**: the three checks as a flow diagram drawn from the live
+  thresholds, why each check exists, and worked scenarios.
 - **Data model**: the six tables, every column and constraint, and the DDL
   for SQLite or PostgreSQL, served by the backend from the live model code.
 - **Tables**: the actual rows of every table, through the API.
+
+The sidebar shows backend and model health. **🔄 Refresh mail** starts a
+background sync and shows a spinner until it finishes. Under **Maintenance**,
+**⚖️ Re-apply rules** and **🧠 Re-run models** re-judge cached mail without
+contacting the mailbox.
 
 ## Backend API
 
@@ -200,12 +210,12 @@ in `mailbox_viewer/__init__.py`. Model inference runs on one dedicated thread
 to keep PyTorch from spawning hundreds of threads. On a laptop CPU, Laya takes
 about 6 seconds per real email; LayoutLMv3 3 to 9 seconds per attachment.
 
-- **Re-run classifier** (sidebar, `POST /reclassify`, `sync_mail.py --reclassify`):
+- **Re-run models** (sidebar, `POST /reclassify`, `sync_mail.py --reclassify`):
   runs both models again over all cached mail. Slow: about 25 minutes for 250 emails.
-- **Re-decide** (`POST /redecide`, `sync_mail.py --redecide`): re-applies the
+- **Re-apply rules** (sidebar, `POST /redecide`, `sync_mail.py --redecide`): re-applies the
   decision rule and the thread rule to the stored predictions after changing
   a threshold. No models, takes about a minute.
-- **Attachments only** (`POST /reclassify?only_with_attachments=true`,
+- **Attachments only** (sidebar toggle, `POST /reclassify?only_with_attachments=true`,
   `sync_mail.py --reclassify --attachments-only`): re-runs only emails with
   attachments, for example after installing Tesseract.
 
@@ -243,7 +253,7 @@ backend/                      the API service: the only part that touches mail, 
     mail_parser.py            raw bytes -> ParsedEmail (headers, participants, bodies, attachments)
     threads.py                conversation key from threading headers
     classifier.py             the two classification steps and the decision rule
-    classification_graph.py   LangGraph flow: body + attachments in parallel, then combine
+    classification_graph.py   LangGraph flow: attachments first, body model only when needed
     document_model.py         loads Laya and LayoutLMv3 from backend/models/
     attachment_store.py       file-system store for attachment bytes
     models.py                 SQLAlchemy models: threads, emails, email_participants,
@@ -262,11 +272,16 @@ backend/                      the API service: the only part that touches mail, 
   requirements.txt
   data/                       attachment files (git-ignored)
 frontend/                     Streamlit, talks to the backend over HTTP only
-  app.py                      inbox: threads, messages, attachments, decisions
-  pages/1_Data_model.py       the six-table model with DDL
-  pages/2_Tables.py           browse the rows of every table
+  app.py                      navigation and the shared sidebar
+  ui.py                       shared sidebar, job runner, badges, formatting
+  views/overview.py           headline numbers, decisions, sync status, rules in force
+  views/inbox.py              threads, messages, attachments, decisions
+  views/decisions.py          the decision log: every email judged, kept or not
+  views/how_it_decides.py     the three checks, live thresholds, scenarios
+  views/data_model.py         the six-table model with DDL
+  views/tables.py             browse the rows of every table
   api_client.py               HTTP client the pages use
-  tests/                      client tests against a stubbed backend
+  tests/                      client and page tests against a stubbed backend
   requirements.txt
 README.md, .env.example, .gitignore
 ```
