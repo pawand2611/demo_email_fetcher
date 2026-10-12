@@ -97,6 +97,19 @@ class ParseMessageTests(unittest.TestCase):
 
         self.assertEqual(parsed.attachments, [])
 
+    def test_inline_photo_is_an_attachment(self) -> None:
+        # A phone photo of an invoice arrives inline with a Content-ID, like a logo, but is large.
+        photo = b"\xff\xd8\xff\xe0 fake jpeg " + b"x" * 200_000
+        msg = _build(html=None)
+        msg.add_related(photo, maintype="image", subtype="jpeg", filename="IMG_0825.jpeg", cid="<img@x>")
+        msg.get_payload()[-1].replace_header("Content-Disposition", 'inline; filename="IMG_0825.jpeg"')
+
+        parsed = parse_message(1, msg.as_bytes())
+
+        self.assertEqual([a.filename for a in parsed.attachments], ["IMG_0825.jpeg"])
+        self.assertEqual(parsed.attachments[0].content_type, "image/jpeg")
+        self.assertEqual(parsed.attachments[0].size_bytes, len(photo))
+
     def test_hostile_filename_is_sanitised(self) -> None:
         msg = _build()
         msg.add_attachment(b"x", maintype="application", subtype="octet-stream", filename="..\\..\\evil<>.exe")
