@@ -189,7 +189,8 @@ class ApiTests(unittest.TestCase):
         self.run_sync()
 
         schema = self.client.get("/schema", params={"dialect": "postgresql"}).json()
-        self.assertEqual([t["name"] for t in schema], ["threads", "emails", "email_participants", "attachments", "sync_state", "decision_log"])
+        self.assertEqual([t["name"] for t in schema], ["threads", "emails", "email_participants", "attachments", "sync_state",
+                                                       "decision_log", "tickets", "ticket_events"])
         emails = next(t for t in schema if t["name"] == "emails")
         message_id = next(c for c in emails["columns"] if c["name"] == "message_id")
         self.assertTrue(message_id["unique"])

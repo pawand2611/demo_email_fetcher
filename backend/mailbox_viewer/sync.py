@@ -11,6 +11,8 @@
    store first. When a thread turns into a payment thread, its earlier mail
    that was dropped is backfilled from the mailbox. Anything else is dropped:
    only the log line remains. ``STORE_ONLY_PAYMENT=false`` keeps everything.
+   In the same transaction the thread's aging ticket is opened, moved to in
+   progress, closed or reopened (see ``tickets.py``).
 6. Move the bookmark.
 
 Idempotent by construction; incremental by UID.
@@ -27,6 +29,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from . import repository as repo
+from . import tickets
 from .attachment_store import AttachmentStoreError, FileSystemStore, build_store
 from .classification_graph import EmailClassifier
 from .classifier import Decision, EmailInput
@@ -34,6 +37,7 @@ from .config import Settings
 from .document_model import load_classifier
 from .mail_client import MailClient, MailClientError, MailConnectionLost
 from .mail_parser import ParsedEmail, parse_message
+from .models import Email, to_naive_utc
 from .threads import ancestor_ids
 
 logger = logging.getLogger(__name__)
@@ -82,6 +86,8 @@ class SyncResult:
     skipped: int = 0
     backfilled: int = 0
     failed: int = 0
+    tickets_opened: int = 0
+    tickets_closed: int = 0
     error: str | None = None
     duration_seconds: float = 0.0
 
@@ -94,6 +100,8 @@ class SyncResult:
             f"{self.kept} kept ({self.payment_hits} payment documents, {self.backfilled} backfilled), "
             f"{self.dropped} dropped, {self.skipped} already judged, {self.failed} failed"
         )
+        if self.tickets_opened or self.tickets_closed:
+            text += f"; tickets: {self.tickets_opened} opened, {self.tickets_closed} closed"
         if self.error:
             text += f" ({self.status}: {self.error})"
         return text
@@ -162,7 +170,8 @@ def _sync_folder(
             )
 
             processor = _Processor(
-                client, session_factory, store, classifier, settings.store_only_payment, totals
+                client, session_factory, store, classifier, settings.store_only_payment, totals,
+                mailbox=settings.imap_user, ticket_close_at=settings.ticket_close_confidence,
             )
             for uid in uids:  # ascending, so last_seen_uid only ever moves forward
                 processor.process(uid)
@@ -201,6 +210,8 @@ class _Processor:
         classifier: EmailClassifier,
         store_only_payment: bool,
         result: SyncResult,
+        mailbox: str = "",
+        ticket_close_at: float = 0.8,
     ) -> None:
         self.client = client
         self.session_factory = session_factory
@@ -208,6 +219,8 @@ class _Processor:
         self.classifier = classifier
         self.store_only_payment = store_only_payment
         self.result = result
+        self.mailbox = mailbox
+        self.ticket_close_at = ticket_close_at
 
     def _classify(self, mail: ParsedEmail) -> Decision:
         return self.classifier.classify(EmailInput.from_parsed(mail))
@@ -256,6 +269,7 @@ class _Processor:
             # Step 3: find the thread; a payment thread keeps its replies.
             thread_id = repo.find_thread_id(session, mail)
             in_payment_thread = thread_id is not None and repo.thread_has_payment(session, thread_id)
+            ticket_active = thread_id is not None and tickets.active_ticket(session, thread_id) is not None
 
         # Step 4: classify; every message gets a decision line. A later email of a
         # thread already classified as payment inherits it (Laya skipped,
@@ -272,17 +286,40 @@ class _Processor:
                 repo.log_decision(session, mail.message_id, decision)
             return "dropped"
 
-        self._store(mail, decision)
+        # A reply in a thread with an open ticket: does it confirm the payment?
+        # One extra body-model call, outside any transaction.
+        confirmation = self.classifier.payment_confirmation(mail.subject, mail.body_text) if ticket_active else None
+        self._store(mail, decision, confirmation=confirmation, update_ticket=True)
         if decision.matched_directly and self.store_only_payment:
             self._backfill_ancestors(mail)
         return "payment" if decision.matched_directly else "kept"
 
-    def _store(self, mail: ParsedEmail, decision: Decision) -> None:
+    def _store(self, mail: ParsedEmail, decision: Decision, confirmation: float | None = None,
+               update_ticket: bool = False) -> None:
         # Files go to the store first, between transactions, so a slow disk
         # never holds the database write lock while the UI is reading.
         blob_keys = [self.store.put(sha256=a.sha256, filename=a.filename, data=a.data) for a in mail.attachments]
         with self.session_factory() as session, session.begin():
-            repo.insert_email(session, mail, decision, blob_keys)
+            email_id = repo.insert_email(session, mail, decision, blob_keys)
+            if update_ticket:
+                self._update_ticket(session, email_id, mail, decision, confirmation)
+
+    def _update_ticket(self, session, email_id: int, mail: ParsedEmail, decision: Decision,
+                       confirmation: float | None) -> None:
+        facts = tickets.MailFacts(
+            message_id=mail.message_id,
+            thread_id=session.get_one(Email, email_id).thread_id,
+            received_at=to_naive_utc(mail.received_at),
+            payment=decision.matched_directly,
+            new_invoice=tickets.carries_invoice(decision),
+            from_us=tickets.is_from([p.address for p in mail.participants if p.role == "from"], self.mailbox),
+            confirmation=confirmation,
+        )
+        event = tickets.apply(session, facts, self.ticket_close_at)
+        if event == "opened":
+            self.result.tickets_opened += 1
+        elif event == "closed":
+            self.result.tickets_closed += 1
 
     def _backfill_ancestors(self, mail: ParsedEmail) -> None:
         """Earlier mail of a thread that has just become a payment thread was

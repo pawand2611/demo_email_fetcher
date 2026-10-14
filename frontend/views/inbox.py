@@ -6,8 +6,8 @@ import pandas as pd
 import streamlit as st
 
 from api_client import ApiError, parse_time
-from ui import (CHECK_BADGES, CHECKS, DECISION_COLORS, DOC_COLORS, PAYMENT_TYPES, TIERS, escape_md, fmt, get_api,
-                human_size, person, which_check)
+from ui import (CHECK_BADGES, CHECKS, DECISION_COLORS, DOC_COLORS, PAYMENT_TYPES, TICKET_STATUS, TIERS, escape_md,
+                fmt, get_api, human_size, person, which_check)
 
 api = get_api()
 st.title("📬 Inbox")
@@ -81,8 +81,19 @@ except ApiError as exc:
     st.stop()
 
 st.divider()
-st.subheader(thread["subject"] or "(no subject)")
-st.caption(f"{thread['message_count']} message(s) in this conversation, newest first.")
+title, ticket_badge = st.columns([5, 1], vertical_alignment="center")
+title.subheader(thread["subject"] or "(no subject)")
+try:
+    ticket = next((t for t in api.tickets() if t["thread_id"] == thread["id"]), None)
+except ApiError:
+    ticket = None
+if ticket:
+    label, color = TICKET_STATUS[ticket["status"]]
+    ticket_badge.badge(f"Ticket: {label.split(' ', 1)[1]}", color=color)
+    st.caption(f"{thread['message_count']} message(s), newest first · ticket age {ticket['age_days']:.1f} days "
+               f"({ticket['bucket']})")
+else:
+    st.caption(f"{thread['message_count']} message(s) in this conversation, newest first.")
 
 
 def render_message(m: dict, expanded: bool) -> None:
@@ -125,11 +136,10 @@ def render_message(m: dict, expanded: bool) -> None:
                 if att["doc_type"]:
                     c1.caption(f"LayoutLMv3: {att['doc_type']} · {att['confidence']:.2f}")
                 c2.caption(f"{att['content_type']} · {human_size(att['size_bytes'])}  \nstored once as {att['blob_key'][:12]}…")
-                try:
-                    c3.download_button("Download", data=api.attachment_bytes(att["id"]), file_name=att["filename"],
-                                       mime=att["content_type"], key=f"download-{att['id']}", width="stretch")
-                except ApiError as exc:
-                    c3.error(str(exc))
+                # The file is fetched only when the button is clicked, not on every page load.
+                c3.download_button("Download", data=lambda aid=att["id"]: api.attachment_bytes(aid),
+                                   file_name=att["filename"], mime=att["content_type"],
+                                   key=f"download-{att['id']}", width="stretch")
         with tab_decision:
             if not d:
                 st.info("No decision logged.")

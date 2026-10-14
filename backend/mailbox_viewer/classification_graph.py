@@ -88,6 +88,11 @@ class EmailClassifier:
         labels = self._on_model_thread(classify_attachments, email.attachments, self.document_model)
         return inherited_decision(labels)
 
+    def payment_confirmation(self, subject: str, body: str) -> float | None:
+        """For tickets: how sure the body model is that this email confirms a
+        payment. None when there is no body model or no text to read."""
+        return self._on_model_thread(self.body_model.confirms_payment, subject, body)
+
     def combine(self, body: BodyDecision, attachments: Sequence[AttachmentDecision]) -> Decision:
         """The decision rule on its own, for re-deciding from stored predictions."""
         return combine(body, attachments, self.min_confidence, self.body_min_confidence, self.decides_above)

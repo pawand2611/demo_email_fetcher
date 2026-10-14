@@ -36,6 +36,21 @@ ROWS = {
 }
 
 
+def _ticket(tid, status, closed_at=None, closed_by=None, reason=None, confidence=None, age=9.5, bucket="8+ days"):
+    return {"id": tid, "thread_id": 1, "subject": "Invoice" if tid == 1 else "Statement Q3", "message_count": 2,
+            "last_message_at": NOW, "status": status, "opened_at": NOW, "in_progress_at": None,
+            "closed_at": closed_at, "closed_by": closed_by, "close_reason": reason, "close_confidence": confidence,
+            "age_days": age, "bucket": bucket}
+
+
+TICKETS = {
+    1: _ticket(1, "open"),
+    2: _ticket(2, "closed", closed_at=NOW, closed_by="auto", reason="payment confirmed by email (0.95)",
+               confidence=0.95, age=3.0, bucket="3–7 days"),
+}
+ACTIONS: list[tuple] = []  # manual ticket actions the pages sent
+
+
 class FakeApi:
     """Answers like the backend for every call the pages make."""
 
@@ -48,14 +63,38 @@ class FakeApi:
         return [{"name": "statement_recon", "active": True, "mailbox": "me@example.com",
                  "folders": ["INBOX", "[Gmail]/Sent Mail"], "keep_policy": "payment_only",
                  "model": "layoutlmv3+laya", "model_min_confidence": 0.5, "body_min_confidence": 0.7,
-                 "attachment_decides_confidence": 0.8, "payment_labels": ["invoice", "receipt", "statement"],
+                 "attachment_decides_confidence": 0.8, "ticket_close_confidence": 0.8,
+                 "payment_labels": ["invoice", "receipt", "statement"],
                  "attachment_store": "local folder data/attachments"}]
 
     def stats(self):
         return {"threads": 1, "emails": 2, "attachments": 1, "payment_threads": 1, "needs_review": 0,
                 "judged": 3, "dropped": 1, "by_doc_type": {"invoice": 1, "none": 1},
                 "by_decision": {"payment": 2, "none": 1},
-                "sync_states": [{"folder_name": "INBOX", "uid_validity": 1, "last_seen_uid": 10, "last_sync_at": NOW}]}
+                "sync_states": [{"folder_name": "INBOX", "uid_validity": 1, "last_seen_uid": 10, "last_sync_at": NOW}],
+                "tickets": {"open": 1, "in_progress": 0, "closed": 1, "oldest_active_days": 9.5,
+                            "active_by_bucket": {"0–2 days": 0, "3–7 days": 0, "8+ days": 1}}}
+
+    def tickets(self, status=None):
+        rows = [TICKETS[1], TICKETS[2]]
+        return [t for t in rows if status is None or t["status"] == status]
+
+    def ticket(self, ticket_id):
+        t = TICKETS[ticket_id]
+        events = [{"event": "opened", "actor": "auto", "at": NOW, "message_id": "<a@x>",
+                   "reason": "first payment email in the thread", "confidence": None}]
+        if t["status"] == "closed":
+            events.append({"event": "closed", "actor": "auto", "at": NOW, "message_id": "<z@x>",
+                           "reason": "payment confirmed by email (0.95)", "confidence": 0.95})
+        return {**t, "events": events}
+
+    def close_ticket(self, ticket_id, reason=None):
+        ACTIONS.append(("close", ticket_id, reason))
+        return self.ticket(ticket_id)
+
+    def reopen_ticket(self, ticket_id, reason=None):
+        ACTIONS.append(("reopen", ticket_id, reason))
+        return self.ticket(ticket_id)
 
     def threads(self, *, payment_only=False, search=None, limit=1000):
         return [{"id": 1, "conversation_key": "<a@x>", "subject": "Invoice", "message_count": 2,
@@ -101,11 +140,13 @@ class FakeApi:
 
 class PagesRender(unittest.TestCase):
     def setUp(self) -> None:
-        ui.get_api.clear()
+        ui._client.clear()
+        ui.clear_cache()
         patcher = patch("ui.ApiClient", FakeApi)
         patcher.start()
         self.addCleanup(patcher.stop)
-        self.addCleanup(ui.get_api.clear)
+        self.addCleanup(ui._client.clear)
+        self.addCleanup(ui.clear_cache)
 
     def run_page(self, page: str | None = None) -> AppTest:
         at = AppTest.from_file("../app.py", default_timeout=30)
@@ -150,9 +191,73 @@ class PagesRender(unittest.TestCase):
         self.assertEqual(values["Attachment decides alone"], "> 0.80")
         self.assertEqual(values["Review band"], "0.50 – 0.70")
 
+    def test_tickets_page_lists_and_counts(self) -> None:
+        at = self.run_page("views/tickets.py")
+        values = {m.label: m.value for m in at.metric}
+        self.assertEqual((values["🔴 Open"], values["🟢 Closed"], values["Oldest active"]), ("1", "1", "10 days"))
+        frame = at.dataframe[0].value
+        self.assertEqual(list(frame["Status"]), ["🔴 Open"])  # default view: active tickets only
+
+    def test_closing_a_ticket_by_hand(self) -> None:
+        ACTIONS.clear()
+        at = AppTest.from_file("../app.py", default_timeout=30)
+        at.session_state["open_ticket"] = 1
+        at.run()
+        at.switch_page("views/tickets.py").run()
+        at.text_input(key="close-reason-1").input("paid by bank transfer").run()
+        at.button(key="close-1").click().run()
+        self.assertFalse(at.exception, [e.value for e in at.exception])
+        self.assertEqual(ACTIONS, [("close", 1, "paid by bank transfer")])
+
+    def test_closed_ticket_offers_reopen(self) -> None:
+        ACTIONS.clear()
+        at = AppTest.from_file("../app.py", default_timeout=30)
+        at.session_state["open_ticket"] = 2
+        at.run()
+        at.switch_page("views/tickets.py").run()
+        at.radio[0].set_value("Closed").run()
+        self.assertEqual(at.main.subheader[0].value, "Statement Q3")
+        at.button(key="reopen-2").click().run()
+        self.assertEqual(ACTIONS, [("reopen", 2, "")])
+
+    def test_inbox_shows_the_ticket_badge(self) -> None:
+        at = self.run_page()
+        at.button(key="open-1").click().run()
+        self.assertIn("ticket age 9.5 days (8+ days)", " ".join(c.value for c in at.caption))
+
     def test_data_model_and_tables(self) -> None:
         self.run_page("views/data_model.py")
         self.run_page("views/tables.py")
+
+
+class CacheTests(unittest.TestCase):
+    """Reads are served from the cache; anything that changes data clears it."""
+
+    def setUp(self) -> None:
+        self.calls: list[str] = []
+        outer = self
+
+        class CountingApi(FakeApi):
+            def stats(self):
+                outer.calls.append("stats")
+                return super().stats()
+
+        ui._client.clear()
+        ui.clear_cache()
+        patcher = patch("ui.ApiClient", CountingApi)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(ui._client.clear)
+        self.addCleanup(ui.clear_cache)
+
+    def test_repeat_reads_hit_the_cache_and_writes_clear_it(self) -> None:
+        api = ui.get_api()
+        api.stats()
+        api.stats()
+        self.assertEqual(self.calls, ["stats"])  # second read came from the cache
+        api.close_ticket(1, "paid")
+        api.stats()
+        self.assertEqual(self.calls, ["stats", "stats"])  # the close cleared it
 
 
 class WhichCheck(unittest.TestCase):

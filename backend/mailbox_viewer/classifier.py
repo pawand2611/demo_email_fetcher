@@ -129,11 +129,16 @@ class DocumentModel(Protocol):
 
 
 class BodyModel(Protocol):
-    """The body model: labels what kind of document the email is about."""
+    """The body model: labels what kind of document the email is about, and
+    says how sure it is that an email confirms a payment (for tickets)."""
 
     name: str
 
     def predict(self, subject: str, body: str) -> Prediction | None: ...
+
+    def confirms_payment(self, subject: str, body: str) -> float | None:
+        """Probability 0..1 that the email confirms a payment was made or received; None if unread."""
+        ...
 
 
 class NoModel:
@@ -151,6 +156,9 @@ class NoBodyModel:
     name = "none"
 
     def predict(self, subject: str, body: str) -> Prediction | None:
+        return None
+
+    def confirms_payment(self, subject: str, body: str) -> float | None:
         return None
 
 

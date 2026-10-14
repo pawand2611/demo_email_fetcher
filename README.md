@@ -59,18 +59,23 @@ Pages (`app.py` sets up the navigation; each page is in `frontend/views/`):
   attachment count and a payment flag. Select a row to read every message,
   its participants, attachments with download buttons, its decision and
   which of the three checks made it.
+- **Tickets**: one aging ticket per payment conversation: open, in progress
+  (we replied) or closed (an email confirmed the payment, or someone closed
+  it). Age and age bucket, history of every change, **Close** and **Reopen**
+  buttons with an optional reason. The rules are in `backend/SCHEMA.md`.
 - **Decision log**: every email judged, kept or not, filterable by decision,
   check and stored / not stored.
 - **How it decides**: the three checks as a flow diagram drawn from the live
   thresholds, why each check exists, and worked scenarios.
-- **Data model**: the six tables, every column and constraint, and the DDL
+- **Data model**: the eight tables, every column and constraint, and the DDL
   for SQLite or PostgreSQL, served by the backend from the live model code.
 - **Tables**: the actual rows of every table, through the API.
 
 The sidebar shows backend and model health. **🔄 Refresh mail** starts a
 background sync and shows a spinner until it finishes. Under **Maintenance**,
 **⚖️ Re-apply rules** and **🧠 Re-run models** re-judge cached mail without
-contacting the mailbox.
+contacting the mailbox, and **🎫 Rebuild tickets** recreates every ticket from
+the stored payment conversations (manual changes are not kept).
 
 ## Backend API
 
@@ -87,6 +92,10 @@ contacting the mailbox.
 | `GET /threads/{id}` | every message with participants, attachments and decision |
 | `GET /attachments/{id}` | file download |
 | `GET /decisions/{message_id}` | audit-trail entry |
+| `GET /tickets?status` | aging tickets: active oldest first, then closed |
+| `GET /tickets/{id}` | one ticket with its history |
+| `POST /tickets/{id}/close`, `POST /tickets/{id}/reopen` | manual close / reopen, body `{"reason": "..."}` optional |
+| `POST /tickets/rebuild` | recreate every ticket from stored mail, in the background |
 | `GET /schema`, `GET /schema/ddl` | data model as JSON, DDL as text |
 | `GET /tables`, `GET /tables/{name}/rows` | raw table browsing |
 
@@ -260,6 +269,7 @@ backend/                      the API service: the only part that touches mail, 
                               attachments, sync_state, decision_log
     db.py                     engine / session factory
     repository.py             every database read and write
+    tickets.py                aging tickets: open, in progress, close, reopen, age
     sync.py                   the sync run: fetch, de-dup, thread, classify, persist
   check_db.py                 database connectivity check
   create_schema.py            create / drop the schema, print DDL
@@ -276,6 +286,7 @@ frontend/                     Streamlit, talks to the backend over HTTP only
   ui.py                       shared sidebar, job runner, badges, formatting
   views/overview.py           headline numbers, decisions, sync status, rules in force
   views/inbox.py              threads, messages, attachments, decisions
+  views/tickets.py            aging tickets with history, close and reopen
   views/decisions.py          the decision log: every email judged, kept or not
   views/how_it_decides.py     the three checks, live thresholds, scenarios
   views/data_model.py         the six-table model with DDL

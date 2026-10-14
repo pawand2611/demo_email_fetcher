@@ -19,6 +19,8 @@ STYLE = {
     "attachments": ("#c8c8c8", "#1f1f1f"),
     "sync_state": ("#e8e6e1", "#1f1f1f"),
     "decision_log": ("#e8e6e1", "#1f1f1f"),
+    "tickets": ("#d9534f", "#ffffff"),
+    "ticket_events": ("#e8e6e1", "#1f1f1f"),
 }
 
 OWNERSHIP = {
@@ -28,6 +30,8 @@ OWNERSHIP = {
     "attachments": "Tied to the message it arrived on. `blob_key` is a reference only; the file lives in the store.",
     "sync_state": "The bookmark, one row per folder: where the next incremental sync resumes.",
     "decision_log": "The audit trail: every email judged, kept or not, with the decision and why.",
+    "tickets": "One per payment thread: open, in progress or closed, when it opened and what closed it.",
+    "ticket_events": "Every status change of a ticket, automatic or manual, with its time and reason.",
 }
 
 

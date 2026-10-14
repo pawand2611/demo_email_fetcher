@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.schema import CheckConstraint, CreateIndex, CreateTable, ForeignKeyConstraint, UniqueConstraint
 
 from mailbox_viewer import repository as repo
+from mailbox_viewer import tickets as tk
 from mailbox_viewer.attachment_store import AttachmentStoreError, FileSystemStore, build_store
 from mailbox_viewer.classification_graph import EmailClassifier
 from mailbox_viewer.classifier import PAYMENT_LABELS
@@ -37,12 +38,13 @@ from mailbox_viewer.sync import ClientFactory, SyncResult, run_sync
 from mailbox_viewer.timeutil import to_ist
 
 from . import schemas as s
-from .jobs import KIND_RECLASSIFY, KIND_REDECIDE, KIND_SYNC, Job, Jobs
+from .jobs import KIND_RECLASSIFY, KIND_REDECIDE, KIND_SYNC, KIND_TICKETS, Job, Jobs
 
 logger = logging.getLogger(__name__)
 
 DIALECTS = {"sqlite": sqlite.dialect(), "postgresql": postgresql.dialect()}
-TABLE_ORDER = ["threads", "emails", "email_participants", "attachments", "sync_state", "decision_log"]
+TABLE_ORDER = ["threads", "emails", "email_participants", "attachments", "sync_state", "decision_log",
+               "tickets", "ticket_events"]
 
 
 @dataclass
@@ -90,6 +92,12 @@ def create_app(services: Services | None = None) -> FastAPI:
         return {"changed": changed, "body_min_confidence": svc.settings.body_min_confidence,
                 "model_min_confidence": svc.settings.model_min_confidence}
 
+    def run_tickets_job() -> dict:
+        with svc.session_factory() as session, session.begin():
+            totals = tk.rebuild(session, svc.classifier.payment_confirmation, svc.settings.imap_user,
+                                svc.settings.ticket_close_confidence)
+        return {"changed": sum(totals.values()), **totals}
+
     def start_job(kind: str, run) -> s.JobOut:
         job, started = jobs.start(kind, run)
         if not started and job.kind != kind:
@@ -129,6 +137,7 @@ def create_app(services: Services | None = None) -> FastAPI:
                 model_min_confidence=st_.model_min_confidence,
                 body_min_confidence=st_.body_min_confidence,
                 attachment_decides_confidence=st_.attachment_decides_confidence,
+                ticket_close_confidence=st_.ticket_close_confidence,
                 payment_labels=sorted(PAYMENT_LABELS),
                 attachment_store=svc.store.describe(),
             )
@@ -136,29 +145,31 @@ def create_app(services: Services | None = None) -> FastAPI:
 
     @app.get("/stats", response_model=s.StatsOut, tags=["service"])
     def stats() -> s.StatsOut:
+        # Few queries on purpose: on a remote database each one is a network round trip.
         with svc.session_factory() as session:
-            emails = repo.count_emails(session)
-            judged = repo.count_decisions(session)
-            states = [repo.get_sync_state(session, f) for f in svc.settings.imap_folders]
+            n = repo.mailbox_counts(session)
+            by_decision = repo.count_by_decision(session)
+            states = repo.get_sync_states(session, svc.settings.imap_folders)
             return s.StatsOut(
-                threads=repo.count_threads(session),
-                emails=emails,
-                attachments=repo.count_attachments(session),
-                payment_threads=repo.count_payment_threads(session),
-                needs_review=repo.count_by_decision(session).get("review", 0),
-                judged=judged,
-                dropped=max(judged - emails, 0),
+                threads=n["threads"],
+                emails=n["emails"],
+                attachments=n["attachments"],
+                payment_threads=n["payment_threads"],
+                needs_review=by_decision.get("review", 0),
+                judged=n["judged"],
+                dropped=max(n["judged"] - n["emails"], 0),
                 by_doc_type=repo.count_by_doc_type(session),
-                by_decision=repo.count_by_decision(session),
+                by_decision=by_decision,
                 sync_states=[
                     s.SyncStateOut(
                         folder_name=f,
-                        uid_validity=st_.uid_validity if st_ else None,
-                        last_seen_uid=st_.last_seen_uid if st_ else 0,
-                        last_sync_at=_ist(st_.last_sync_at) if st_ else None,
+                        uid_validity=states[f].uid_validity if f in states else None,
+                        last_seen_uid=states[f].last_seen_uid if f in states else 0,
+                        last_sync_at=_ist(states[f].last_sync_at) if f in states else None,
                     )
-                    for f, st_ in zip(svc.settings.imap_folders, states)
+                    for f in svc.settings.imap_folders
                 ],
+                tickets=s.TicketCountsOut(**tk.counts(session)),
             )
 
     # -- sync and classification ----------------------------------------------------------
@@ -177,6 +188,12 @@ def create_app(services: Services | None = None) -> FastAPI:
     def redecide() -> s.JobOut:
         """Re-apply the decision rule to stored predictions. No models, no mail server; takes seconds."""
         return start_job(KIND_REDECIDE, run_redecide_job)
+
+    @app.post("/tickets/rebuild", response_model=s.JobOut, status_code=202, tags=["jobs"])
+    def rebuild_tickets() -> s.JobOut:
+        """Recreate every ticket from the stored payment threads. Runs the body model on
+        replies in open tickets; manual changes are not kept."""
+        return start_job(KIND_TICKETS, run_tickets_job)
 
     @app.get("/sync/latest", response_model=s.JobOut | None, tags=["jobs"])
     def latest_sync() -> s.JobOut | None:
@@ -209,11 +226,7 @@ def create_app(services: Services | None = None) -> FastAPI:
             thread = repo.get_thread(session, thread_id)
             if thread is None:
                 raise HTTPException(404, f"no thread {thread_id}")
-            messages = []
-            for summary in repo.list_thread_emails(session, thread_id):
-                detail = repo.get_email_detail(session, summary.id)
-                if detail is not None:
-                    messages.append(_message_out(detail, repo.get_decision(session, detail.message_id)))
+            messages = [_message_out(detail, decision) for detail, decision in repo.get_thread_messages(session, thread_id)]
         return s.ThreadDetailOut(**_thread_out(thread).model_dump(), messages=messages)
 
     @app.get("/attachments/{attachment_id}", tags=["mail"], response_class=Response)
@@ -239,6 +252,47 @@ def create_app(services: Services | None = None) -> FastAPI:
         if decision is None:
             raise HTTPException(404, f"no decision for {message_id!r}")
         return _decision_out(decision)
+
+    # -- aging tickets ----------------------------------------------------------------------
+
+    @app.get("/tickets", response_model=list[s.TicketOut], tags=["tickets"])
+    def list_tickets(status: str | None = Query(None, pattern="^(open|in_progress|closed)$")) -> list[s.TicketOut]:
+        """Active tickets oldest first, then closed ones most recently closed first."""
+        with svc.session_factory() as session:
+            return [_ticket_out(v) for v in tk.list_tickets(session, status)]
+
+    @app.get("/tickets/{ticket_id}", response_model=s.TicketDetailOut, tags=["tickets"])
+    def get_ticket(ticket_id: int) -> s.TicketDetailOut:
+        with svc.session_factory() as session:
+            found = tk.get_ticket(session, ticket_id)
+        if found is None:
+            raise HTTPException(404, f"no ticket {ticket_id}")
+        view, events = found
+        return s.TicketDetailOut(
+            **_ticket_out(view).model_dump(),
+            events=[s.TicketEventOut(event=e.event, actor=e.actor, at=_ist(e.at), message_id=e.message_id,
+                                     reason=e.reason, confidence=e.confidence) for e in events],
+        )
+
+    @app.post("/tickets/{ticket_id}/close", response_model=s.TicketDetailOut, tags=["tickets"])
+    def close_ticket(ticket_id: int, body: s.TicketActionIn | None = None) -> s.TicketDetailOut:
+        """Close by hand, e.g. when the payment was confirmed outside email."""
+        _ticket_action(tk.close_manually, ticket_id, body)
+        return get_ticket(ticket_id)
+
+    @app.post("/tickets/{ticket_id}/reopen", response_model=s.TicketDetailOut, tags=["tickets"])
+    def reopen_ticket(ticket_id: int, body: s.TicketActionIn | None = None) -> s.TicketDetailOut:
+        _ticket_action(tk.reopen_manually, ticket_id, body)
+        return get_ticket(ticket_id)
+
+    def _ticket_action(action, ticket_id: int, body: s.TicketActionIn | None) -> None:
+        try:
+            with svc.session_factory() as session, session.begin():
+                action(session, ticket_id, body.reason if body else None)
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except tk.TicketError as exc:
+            raise HTTPException(409, str(exc)) from exc
 
     # -- data model and raw tables ------------------------------------------------------------
 
@@ -322,6 +376,15 @@ def _thread_out(t: repo.ThreadSummary) -> s.ThreadOut:
         has_payment=t.has_payment,
         participants=t.participants,
         attachment_count=t.attachment_count,
+    )
+
+
+def _ticket_out(v: tk.TicketView) -> s.TicketOut:
+    return s.TicketOut(
+        id=v.id, thread_id=v.thread_id, subject=v.subject, message_count=v.message_count,
+        last_message_at=_ist(v.last_message_at), status=v.status, opened_at=_ist(v.opened_at),
+        in_progress_at=_ist(v.in_progress_at), closed_at=_ist(v.closed_at), closed_by=v.closed_by,
+        close_reason=v.close_reason, close_confidence=v.close_confidence, age_days=v.age_days, bucket=v.bucket,
     )
 
 

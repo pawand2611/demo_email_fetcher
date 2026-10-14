@@ -23,12 +23,60 @@ CHECKS = {
 }
 CHECK_BADGES = {1: ("inherited", "blue"), 2: ("attachment", "violet"), 3: ("email text", "blue"),
                 None: ("unclassified", "gray")}
+TICKET_STATUS = {"open": ("🔴 Open", "red"), "in_progress": ("🟠 In progress", "orange"), "closed": ("🟢 Closed", "green")}
+TICKET_EVENTS = {"opened": "Opened", "in_progress": "In progress", "closed": "Closed", "reopened": "Reopened"}
 TIERS = "0 nothing classified · 1 attachment model · 2 body model · 3 both models"
 
 
+# -- API access with a short cache ------------------------------------------------------------
+#
+# Every Streamlit click reruns the whole page, and the backend's database is
+# far away (each query is a network round trip), so read calls are cached for
+# CACHE_SECONDS. Anything that changes data clears the cache: Refresh mail,
+# the maintenance jobs, closing or reopening a ticket, and the Reload button.
+
+CACHE_SECONDS = 60
+_READS = {"health", "profiles", "stats", "threads", "thread", "tickets", "ticket", "table_rows", "tables",
+          "schema", "ddl", "latest_sync"}
+_WRITES = {"start_sync", "reclassify", "redecide", "rebuild_tickets", "close_ticket", "reopen_ticket"}
+
+
 @st.cache_resource(show_spinner=False)
-def get_api() -> ApiClient:
+def _client() -> ApiClient:
     return ApiClient()
+
+
+@st.cache_data(ttl=CACHE_SECONDS, show_spinner=False)
+def _cached_call(name: str, args: tuple, kwargs: tuple):
+    return getattr(_client(), name)(*args, **dict(kwargs))
+
+
+def clear_cache() -> None:
+    _cached_call.clear()
+
+
+class CachedApi:
+    """The API client, with read calls cached and write calls clearing the cache."""
+
+    def __init__(self, client: ApiClient) -> None:
+        self._client = client
+
+    def __getattr__(self, name: str):
+        target = getattr(self._client, name)
+        if name in _READS:
+            return lambda *args, **kwargs: _cached_call(name, args, tuple(sorted(kwargs.items())))
+        if name in _WRITES:
+            def write(*args, **kwargs):
+                try:
+                    return target(*args, **kwargs)
+                finally:
+                    clear_cache()
+            return write
+        return target  # job polling, attachment downloads, base_url: always live
+
+
+def get_api() -> CachedApi:
+    return CachedApi(_client())
 
 
 def which_check(tier: int | None, reason: str | None) -> int | None:
@@ -45,7 +93,7 @@ def which_check(tier: int | None, reason: str | None) -> int | None:
 # -- sidebar ------------------------------------------------------------------------------
 
 
-def render_sidebar(api: ApiClient) -> None:
+def render_sidebar(api: CachedApi) -> None:
     with st.sidebar:
         st.markdown("### 📬 Statement Recon")
         try:
@@ -70,6 +118,10 @@ def render_sidebar(api: ApiClient) -> None:
         if st.button("🔄 Refresh mail", type="primary", width="stretch",
                      help="Fetch only mail newer than the last sync, then classify it"):
             run_job(api, "Syncing and classifying new mail…", api.start_sync)
+        if st.button("♻️ Reload data", width="stretch",
+                     help=f"Pages keep data for {CACHE_SECONDS} seconds to stay fast. This fetches it fresh now."):
+            clear_cache()
+            st.rerun()
 
         with st.expander("Maintenance"):
             st.caption("Use these after changing a model or a threshold. Neither contacts the mailbox.")
@@ -82,13 +134,17 @@ def render_sidebar(api: ApiClient) -> None:
                          help="Re-run the models over cached mail. A full run takes many minutes."):
                 run_job(api, "Re-running the models over cached mail…",
                         lambda: api.reclassify(only_with_attachments=only_files))
+            if st.button("🎫 Rebuild tickets", width="stretch",
+                         help="Recreate every ticket from the stored payment conversations. "
+                              "Manual closes and reopens are not kept."):
+                run_job(api, "Rebuilding tickets from stored mail…", api.rebuild_tickets)
 
         job = st.session_state.get("last_job")
         if job is not None:
             show_job(job)
 
 
-def run_job(api: ApiClient, label: str, start) -> None:
+def run_job(api: CachedApi, label: str, start) -> None:
     try:
         job = start()
         with st.spinner(label, show_time=True):
@@ -98,6 +154,8 @@ def run_job(api: ApiClient, label: str, start) -> None:
         st.session_state["last_job"] = job
     except ApiError as exc:
         st.warning(str(exc))
+    finally:
+        clear_cache()  # the job changed the data
 
 
 def show_job(job: dict) -> None:
@@ -109,6 +167,9 @@ def show_job(job: dict) -> None:
         status = result.get("status")
         text = f"Synced in {result.get('duration_seconds', 0)}s: {result.get('summary', '')}"
         (st.success if status == "ok" else st.warning if status == "partial" else st.error)(text)
+    elif job["kind"] == "tickets":
+        st.success(f"Tickets rebuilt: {result.get('opened', 0)} opened, {result.get('in_progress', 0)} in progress, "
+                   f"{result.get('closed', 0)} closed.")
     elif "changed" in result:
         st.success(f"{job['kind'].capitalize()} done: {result['changed']} email(s) changed.")
 

@@ -36,13 +36,25 @@ class FakeDocumentModel:
 class FakeBodyModel:
     """Stands in for Laya. Picks the document type from words in the subject
     and body: statement 0.93, invoice 0.92, receipt 0.91, otherwise other 0.80.
-    ``overrides`` maps a subject to a fixed prediction."""
+    ``overrides`` maps a subject to a fixed prediction.
+
+    Payment confirmation: 0.95 when the body says "payment received" or
+    "have paid", otherwise 0.20; ``confirmations`` maps a subject to a score."""
 
     name = "fake-body"
 
     def __init__(self) -> None:
         self.overrides: dict[str, Prediction] = {}
+        self.confirmations: dict[str, float] = {}
         self.calls: list[str] = []
+        self.confirmation_calls: list[str] = []
+
+    def confirms_payment(self, subject: str, body: str) -> float | None:
+        self.confirmation_calls.append(subject)
+        if subject in self.confirmations:
+            return self.confirmations[subject]
+        text = body.lower()
+        return 0.95 if "payment received" in text or "have paid" in text else 0.20
 
     def predict(self, subject: str, body: str) -> Prediction | None:
         self.calls.append(subject)

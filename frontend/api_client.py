@@ -73,6 +73,24 @@ class ApiClient:
         """Start re-applying the decision rules to stored scores (no models); returns the job."""
         return self._json("POST", "/redecide")
 
+    # -- tickets ----------------------------------------------------------------------
+
+    def tickets(self, status: str | None = None) -> list[dict[str, Any]]:
+        return self._json("GET", "/tickets", params={"status": status} if status else None)
+
+    def ticket(self, ticket_id: int) -> dict[str, Any]:
+        return self._json("GET", f"/tickets/{ticket_id}")
+
+    def close_ticket(self, ticket_id: int, reason: str | None = None) -> dict[str, Any]:
+        return self._json("POST", f"/tickets/{ticket_id}/close", body={"reason": reason or None})
+
+    def reopen_ticket(self, ticket_id: int, reason: str | None = None) -> dict[str, Any]:
+        return self._json("POST", f"/tickets/{ticket_id}/reopen", body={"reason": reason or None})
+
+    def rebuild_tickets(self) -> dict[str, Any]:
+        """Start recreating every ticket from stored mail in the background; returns the job."""
+        return self._json("POST", "/tickets/rebuild")
+
     # -- mail -----------------------------------------------------------------------
 
     def threads(self, *, payment_only: bool = False, search: str | None = None, limit: int = 1000) -> list[dict[str, Any]]:
@@ -106,12 +124,12 @@ class ApiClient:
 
     # -- transport ------------------------------------------------------------------
 
-    def _json(self, method: str, path: str, params: dict[str, Any] | None = None) -> Any:
-        return self._request(method, path, params=params).json()
+    def _json(self, method: str, path: str, params: dict[str, Any] | None = None, body: Any = None) -> Any:
+        return self._request(method, path, params=params, body=body).json()
 
-    def _request(self, method: str, path: str, params: dict[str, Any] | None = None) -> httpx.Response:
+    def _request(self, method: str, path: str, params: dict[str, Any] | None = None, body: Any = None) -> httpx.Response:
         try:
-            response = self._http.request(method, path, params=params)
+            response = self._http.request(method, path, params=params, json=body)
         except httpx.TransportError as exc:
             raise ApiError(f"Backend not reachable at {self.base_url} ({type(exc).__name__}). Start it with: {START_HINT}") from exc
         if response.status_code >= 400:
