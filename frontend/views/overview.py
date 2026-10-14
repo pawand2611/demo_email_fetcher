@@ -30,6 +30,17 @@ cols[3].metric("Needs review", stats["needs_review"], help="Payment answers betw
 cols[4].metric("Emails judged", stats["judged"], help="Every email the models looked at, kept or not")
 cols[5].metric("Not kept", stats["dropped"], help="Judged as not payment-related; only the decision is logged")
 
+tickets = stats["tickets"]
+t = st.columns(6)
+t[0].metric("🔴 Open tickets", tickets["open"])
+t[1].metric("🟠 In progress", tickets["in_progress"])
+t[2].metric("🟢 Closed", tickets["closed"])
+oldest = tickets["oldest_active_days"]
+t[3].metric("Oldest active", f"{oldest:.0f} days" if oldest is not None else "–")
+t[4].metric("Active 8+ days", tickets["active_by_bucket"].get("8+ days", 0))
+with t[5]:
+    st.page_link("views/tickets.py", label="Open tickets", icon="🎫")
+
 if stats["judged"] == 0:
     st.info("No mail judged yet. Press **🔄 Refresh mail** in the sidebar to run the first sync.")
     st.stop()

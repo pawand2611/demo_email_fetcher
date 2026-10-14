@@ -500,8 +500,28 @@ def _email_summary(row: Email) -> EmailSummary:
 
 def get_email_detail(session: Session, email_id: int) -> EmailDetail | None:
     row = session.get(Email, email_id, options=[selectinload(Email.participants), selectinload(Email.attachments)])
-    if row is None:
-        return None
+    return _email_detail(row) if row is not None else None
+
+
+def get_thread_messages(session: Session, thread_id: int) -> list[tuple[EmailDetail, DecisionInfo | None]]:
+    """Every message of a thread, newest first, with its decision line.
+
+    Four queries in all (emails, participants, attachments, decisions) however
+    long the thread is: on a remote database each query is a network round trip.
+    """
+    rows = session.scalars(
+        select(Email)
+        .options(selectinload(Email.participants), selectinload(Email.attachments))
+        .where(Email.thread_id == thread_id)
+        .order_by(Email.received_at.desc().nulls_last(), Email.id.desc())
+    ).all()
+    ids = [r.message_id for r in rows]
+    logged = session.scalars(select(DecisionLog).where(DecisionLog.message_id.in_(ids))).all() if ids else []
+    decisions = {d.message_id: _decision_info(d) for d in logged}
+    return [(_email_detail(r), decisions.get(r.message_id)) for r in rows]
+
+
+def _email_detail(row: Email) -> EmailDetail:
     return EmailDetail(
         id=row.id,
         thread_id=row.thread_id,
@@ -538,8 +558,10 @@ def get_attachment_files(session: Session, email_id: int, store: FileSystemStore
 
 def get_decision(session: Session, message_id: str) -> DecisionInfo | None:
     row = session.get(DecisionLog, message_id)
-    if row is None:
-        return None
+    return _decision_info(row) if row is not None else None
+
+
+def _decision_info(row: DecisionLog) -> DecisionInfo:
     return DecisionInfo(row.message_id, row.tier, row.decision, row.confidence, row.reason, row.decided_at)
 
 
@@ -586,6 +608,23 @@ def count_by_doc_type(session: Session) -> dict[str, int]:
 def count_by_decision(session: Session) -> dict[str, int]:
     rows = session.execute(select(DecisionLog.decision, func.count()).group_by(DecisionLog.decision))
     return {decision: count for decision, count in rows}
+
+
+def mailbox_counts(session: Session) -> dict[str, int]:
+    """Threads, emails, attachments, payment threads and decisions in one query."""
+    def total(model, *where):
+        return select(func.count()).select_from(model).where(*where).scalar_subquery()
+
+    row = session.execute(select(
+        total(Thread), total(Email), total(Attachment),
+        total(Thread, Thread.has_payment.is_(True)), total(DecisionLog),
+    )).one()
+    return dict(zip(("threads", "emails", "attachments", "payment_threads", "judged"), (v or 0 for v in row)))
+
+
+def get_sync_states(session: Session, folder_names: Sequence[str]) -> dict[str, SyncStateInfo]:
+    rows = session.scalars(select(SyncState).where(SyncState.folder_name.in_(list(folder_names)))).all()
+    return {r.folder_name: SyncStateInfo(r.folder_name, r.uid_validity, r.last_seen_uid, r.last_sync_at) for r in rows}
 
 
 # -- sync state --------------------------------------------------------------------

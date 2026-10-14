@@ -48,6 +48,8 @@ class Settings:
     attachment_decides_confidence: float = 0.8
     # Name of the business purpose this deployment serves.
     profile_name: str = "statement_recon"
+    # Tickets: a reply that Laya scores at least this sure is a payment confirmation closes the ticket.
+    ticket_close_confidence: float = 0.8
 
     def __post_init__(self) -> None:
         if not self.imap_folders:
@@ -70,6 +72,7 @@ _DEFAULTS = {
     "ATTACHMENT_MODEL_DIR": "models/layoutlmv3_invoice",
     "BODY_MODEL_DIR": "models/laya",
     "PROFILE_NAME": "statement_recon",
+    "TICKET_CLOSE_CONFIDENCE": "0.8",
 }
 
 
@@ -116,6 +119,7 @@ def load_settings(env_file: str | os.PathLike[str] | None = None) -> Settings:
         body_min_confidence=_get_fraction("BODY_MIN_CONFIDENCE"),
         attachment_decides_confidence=_get_fraction("ATTACHMENT_DECIDES_CONFIDENCE"),
         profile_name=_get("PROFILE_NAME") or "statement_recon",
+        ticket_close_confidence=_get_fraction("TICKET_CLOSE_CONFIDENCE"),
     )
 
 

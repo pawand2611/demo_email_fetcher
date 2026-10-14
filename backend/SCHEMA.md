@@ -2,7 +2,8 @@
 
 Status: the six-table model below was adopted on 2026-09-30 from a design
 sketch and is the live schema (`mailbox_viewer/models.py`). It replaced the
-original three-table design, whose history is at the end of this file.
+original three-table design, whose history is at the end of this file. Two
+tables for aging tickets (`tickets`, `ticket_events`) were added on 2026-10-14.
 
 Database: SQLite or PostgreSQL via SQLAlchemy 2.x ORM, selected by
 `DATABASE_URL`. The same models produce `DATETIME` on SQLite and `TIMESTAMP`
@@ -16,6 +17,8 @@ erDiagram
     THREADS ||--o{ EMAILS : "1..n"
     EMAILS ||--o{ EMAIL_PARTICIPANTS : "0..n"
     EMAILS ||--o{ ATTACHMENTS : "0..n"
+    THREADS ||--o| TICKETS : "0..1"
+    TICKETS ||--o{ TICKET_EVENTS : "1..n"
 
     THREADS {
         int      id               PK
@@ -73,6 +76,30 @@ erDiagram
         text     reason
         datetime decided_at
     }
+    TICKETS {
+        int      id                   PK
+        int      thread_id            FK "UK, -> threads.id, ON DELETE CASCADE"
+        text     status               "open | in_progress | closed"
+        datetime opened_at            "received time of the first payment email"
+        text     opened_by_message_id
+        datetime in_progress_at
+        datetime closed_at
+        text     closed_by            "auto | manual"
+        text     closed_by_message_id
+        text     close_reason
+        float    close_confidence
+        datetime updated_at
+    }
+    TICKET_EVENTS {
+        int      id         PK
+        int      ticket_id  FK "-> tickets.id, ON DELETE CASCADE"
+        text     event      "opened | in_progress | closed | reopened"
+        text     actor      "auto | manual"
+        datetime at
+        text     message_id
+        text     reason
+        float    confidence
+    }
 ```
 
 ## Ownership
@@ -93,6 +120,10 @@ erDiagram
   de-dup makes that safe.
 - **decision_log**: the audit trail, one row per message, rewritten each time
   the rules run.
+- **tickets**: one per payment thread (`thread_id` UNIQUE). Written by the
+  sync in the same transaction as the email that changes it; closed or
+  reopened by hand from the UI; recreated by **Rebuild tickets**.
+- **ticket_events**: every status change, with time, actor and reason.
 
 ## How data moves on one refresh
 
@@ -106,7 +137,7 @@ The bookmark is read first and moved last.
 | 4 | **Find the thread.** A reply into a thread with `has_payment` is kept regardless of its own content. | `threads`, `emails` | |
 | 5 | **Classify** with both models (LangGraph: Laya on the body, LayoutLMv3 on attachments, then the decision rule) | | `decision_log` |
 | 6 | **Keep?** Payment document, or payment thread, or `STORE_ONLY_PAYMENT=false` (the default) → save. Otherwise drop: only the log line is written. | | |
-| 7 | **Save in one transaction**: thread (found or created), email, participants, attachments. Files were written to the store just before. When a thread turns into a payment thread, its earlier mail that was dropped is backfilled from the mailbox by Message-ID. | | `threads`, `emails`, `email_participants`, `attachments`, files |
+| 7 | **Save in one transaction**: thread (found or created), email, participants, attachments, and the thread's ticket (open, in progress, close, reopen). Files were written to the store just before. When a thread turns into a payment thread, its earlier mail that was dropped is backfilled from the mailbox by Message-ID. | `tickets` | `threads`, `emails`, `email_participants`, `attachments`, `tickets`, `ticket_events`, files |
 | 8 | Move the bookmark | | `sync_state` |
 
 Streamlit reads `threads`, `emails`, `email_participants`, `attachments` and
@@ -132,6 +163,22 @@ constraint in place). `tier`: 0 nothing classified, 1 attachment model only,
 2 body model only, 3 both. The reason always starts with the body model's
 label and score (`body: receipt (0.75) ...`), which is what lets `--redecide`
 re-apply a changed rule without running the models again.
+
+## Tickets
+
+One aging ticket per payment thread (`tickets.py`):
+
+| Event | Rule |
+|---|---|
+| **Open** | The first email of a thread judged payment on its own content. Age counts from its received time. |
+| **In progress** | We reply in the thread: an email sent from `IMAP_USER`. |
+| **Closed** | A later reply that Laya scores at least `TICKET_CLOSE_CONFIDENCE` (0.8) on "does this email confirm that a payment has been made or received?". Asked only while a ticket is active. |
+| **Never closes** | An email that carries a new invoice. Checked on 2026-10-14: a plain invoice scored 0.75 on the question, too close to the bar. |
+| **Reopened** | A new invoice arriving in a closed thread. |
+| **Manual** | Close or reopen from the Tickets page, with an optional reason (`actor = manual`). |
+
+Age: open and in-progress tickets age until now, closed ones stop at the close.
+Buckets: 0–2, 3–7 and 8+ days.
 
 ## Attachments
 
@@ -162,3 +209,7 @@ store refuses any key that could escape its root.
 - 2026-10-07: inherited emails get their attachments labelled by LayoutLMv3.
   Storage switched to payment-related mail only (`STORE_ONLY_PAYMENT=true`);
   review emails are kept so they can be checked.
+- 2026-10-12: inline images of 20 KB or more count as attachments, so invoice
+  photos added from a phone (inline, with a Content-ID) reach LayoutLMv3.
+- 2026-10-14: aging tickets: `tickets` and `ticket_events` added, opened and
+  closed by the mail itself (Laya confirmation at 0.8) or by hand.

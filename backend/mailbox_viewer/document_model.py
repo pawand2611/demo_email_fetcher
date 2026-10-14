@@ -39,6 +39,15 @@ LAYA_QUESTION = {
     "criteria": BODY_LABELS,
 }
 
+# Tickets: a yes/no question. Checked 2026-10-14 on four samples: payment
+# confirmations scored 0.90 and 0.97, an overdue reminder 0.33, but a plain
+# invoice 0.75, close to the 0.80 bar. That is why an email carrying a new
+# invoice never closes a ticket (see tickets.py).
+LAYA_CONFIRMATION_QUESTION = {
+    "type": "noul",
+    "instructions": "Does the email in `body` confirm that a payment has been made or received?",
+}
+
 
 class LayoutLMv3InvoiceModel:
     """Attachment model: invoice vs not_invoice for the first page of a file."""
@@ -84,6 +93,13 @@ class LayaBodyModel:
         answer = self._agent.system_one({"body": text}, {"doc_type": LAYA_QUESTION})["answers"]["doc_type"]
         label = answer["choice"]
         return Prediction(label, float(answer["probabilities"][label]))
+
+    def confirms_payment(self, subject: str, body: str) -> float | None:
+        text = self._clean(body)
+        if not text.strip():
+            return None
+        answer = self._agent.system_one({"body": text}, {"confirmed": LAYA_CONFIRMATION_QUESTION})["answers"]["confirmed"]
+        return float(answer["noul"])
 
 
 def load_classifier(settings: Settings) -> EmailClassifier:

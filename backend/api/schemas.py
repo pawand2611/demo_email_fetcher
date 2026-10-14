@@ -25,6 +25,7 @@ class ProfileOut(BaseModel):
     model_min_confidence: float
     body_min_confidence: float
     attachment_decides_confidence: float
+    ticket_close_confidence: float
     payment_labels: list[str]
     attachment_store: str
 
@@ -34,6 +35,14 @@ class SyncStateOut(BaseModel):
     uid_validity: int | None
     last_seen_uid: int
     last_sync_at: datetime | None
+
+
+class TicketCountsOut(BaseModel):
+    open: int
+    in_progress: int
+    closed: int
+    oldest_active_days: float | None
+    active_by_bucket: dict[str, int]
 
 
 class StatsOut(BaseModel):
@@ -47,6 +56,7 @@ class StatsOut(BaseModel):
     by_doc_type: dict[str, int]
     by_decision: dict[str, int]
     sync_states: list[SyncStateOut]
+    tickets: TicketCountsOut
 
 
 class ParticipantOut(BaseModel):
@@ -126,6 +136,8 @@ class SyncResultOut(BaseModel):
     skipped: int
     backfilled: int
     failed: int
+    tickets_opened: int = 0
+    tickets_closed: int = 0
     error: str | None
     duration_seconds: float
     summary: str
@@ -148,6 +160,40 @@ class JobOut(BaseModel):
     finished_at: datetime | None
     result: dict[str, Any] | None
     error: str | None
+
+
+class TicketOut(BaseModel):
+    id: int
+    thread_id: int
+    subject: str
+    message_count: int
+    last_message_at: datetime | None
+    status: str  # open | in_progress | closed
+    opened_at: datetime
+    in_progress_at: datetime | None
+    closed_at: datetime | None
+    closed_by: str | None  # auto | manual
+    close_reason: str | None
+    close_confidence: float | None
+    age_days: float
+    bucket: str
+
+
+class TicketEventOut(BaseModel):
+    event: str  # opened | in_progress | closed | reopened
+    actor: str  # auto | manual
+    at: datetime
+    message_id: str | None
+    reason: str | None
+    confidence: float | None
+
+
+class TicketDetailOut(TicketOut):
+    events: list[TicketEventOut]
+
+
+class TicketActionIn(BaseModel):
+    reason: str | None = None
 
 
 class TableInfoOut(BaseModel):

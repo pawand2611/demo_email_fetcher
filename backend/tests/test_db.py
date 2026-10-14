@@ -13,7 +13,8 @@ from sqlalchemy.schema import CreateTable
 from mailbox_viewer.db import init_db, make_engine
 from mailbox_viewer.models import Attachment, Base
 
-EXPECTED_TABLES = {"threads", "emails", "email_participants", "attachments", "sync_state", "decision_log"}
+EXPECTED_TABLES = {"threads", "emails", "email_participants", "attachments", "sync_state", "decision_log",
+                   "tickets", "ticket_events"}
 
 
 class SchemaTests(unittest.TestCase):
@@ -25,7 +26,7 @@ class SchemaTests(unittest.TestCase):
         self.engine.dispose()
         self.tmp.cleanup()
 
-    def test_init_db_creates_all_six_tables_and_is_idempotent(self) -> None:
+    def test_init_db_creates_all_tables_and_is_idempotent(self) -> None:
         init_db(self.engine)
         init_db(self.engine)
 
@@ -46,6 +47,9 @@ class SchemaTests(unittest.TestCase):
         self.assertIn("ON DELETE RESTRICT", ddl["emails"])
         self.assertIn("UNIQUE (message_id)", ddl["emails"])
         self.assertIn("CHECK (role IN ('from', 'to', 'cc', 'bcc'))", ddl["email_participants"])
+        self.assertIn("CHECK (status IN ('open', 'in_progress', 'closed'))", ddl["tickets"])
+        self.assertIn("UNIQUE (thread_id)", ddl["tickets"])
+        self.assertIn("ON DELETE CASCADE", ddl["ticket_events"])
 
     def test_models_compile_to_sqlite_ddl(self) -> None:
         ddl = str(CreateTable(Attachment.__table__).compile(dialect=sqlite.dialect()))

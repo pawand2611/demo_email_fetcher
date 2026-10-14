@@ -1,4 +1,4 @@
-"""Streamlit frontend: overview, inbox, decision log, the decision rules and the data model.
+"""Streamlit frontend: overview, inbox, tickets, decision log, the decision rules and the data model.
 
 It talks only to the backend API (``API_URL``, default http://127.0.0.1:8000);
 it never opens the database or the mailbox itself.
@@ -20,6 +20,7 @@ pages = {
     "Mailbox": [
         st.Page("views/overview.py", title="Overview", icon="🏠", default=True),
         st.Page("views/inbox.py", title="Inbox", icon="📬"),
+        st.Page("views/tickets.py", title="Tickets", icon="🎫"),
         st.Page("views/decisions.py", title="Decision log", icon="🧾"),
     ],
     "How it works": [
