@@ -23,11 +23,14 @@ class PredictionResult:
 
 
 class AttachmentClassifier:
-    def __init__(self, model_dir: Path | str, cfg: Config | None = None) -> None:
+    def __init__(self, model_dir: Path | str, cfg: Config | None = None,
+                 processor_dir: Path | str | None = None) -> None:
+        """``processor_dir`` defaults to ``model_dir``; pass the base model folder when loading a raw
+        Trainer checkpoint, which contains weights but no tokenizer / image-processor files."""
         self.cfg = cfg or Config()
         self.model_dir = Path(model_dir)
         self.device = get_device()
-        self.processor = LayoutLMv3Processor.from_pretrained(self.model_dir, apply_ocr=False)
+        self.processor = LayoutLMv3Processor.from_pretrained(processor_dir or self.model_dir, apply_ocr=False)
         self.model = LayoutLMv3ForSequenceClassification.from_pretrained(self.model_dir).to(self.device).eval()
         logger.info("Loaded model from %s (threshold=%.2f)", self.model_dir, self.cfg.threshold)
 

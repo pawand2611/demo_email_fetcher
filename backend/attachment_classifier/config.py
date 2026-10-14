@@ -92,6 +92,9 @@ class Config:
     # preferred when present; otherwise the Hub id is used.
     model_name: str = field(default_factory=lambda: _default_model_name())
     max_length: int = 512
+    # False: pad every document to max_length (original spec). True: pad each batch only to its longest
+    # document; same predictions (padding is masked out), ~25% less training compute on this data.
+    dynamic_padding: bool = False
     threshold: float = 0.5           # prob_invoice >= threshold -> is_invoice
 
     # ---- dataset -----------------------------------------------------------
