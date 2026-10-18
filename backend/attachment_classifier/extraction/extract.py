@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import io
 import logging
+import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
@@ -24,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 DOCX_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 IMAGE_TYPES = {"image/jpeg", "image/jpg", "image/png"}
+DOCX_BATCH = 40  # DOCX files per LibreOffice call
 
 
 @dataclass
@@ -114,6 +116,17 @@ def _run_soffice(cfg: Config, sources: list[Path], outdir: str) -> None:
         raise ExtractionError("soffice timed out") from exc
 
 
+def _convert(cfg: Config, sources: list[Path], outdir: str) -> None:
+    """Run soffice; if it exits cleanly but writes no PDF at all, the profile is usually corrupt:
+    reset it (it is a disposable cache) and retry the missing files once."""
+    _run_soffice(cfg, sources, outdir)
+    missing = [s for s in sources if not s.with_suffix(".pdf").is_file()]
+    if missing and len(missing) == len(sources):
+        logger.warning("soffice wrote no PDFs; resetting LibreOffice profile %s and retrying", cfg.soffice_profile_dir)
+        shutil.rmtree(cfg.soffice_profile_dir, ignore_errors=True)
+        _run_soffice(cfg, missing, outdir)
+
+
 def convert_docx_batch(blobs: list[bytes], cfg: Config) -> int:
     """Convert many DOCX files in ONE soffice call (amortises its slow start-up) into the
     sha256-keyed PDF cache that _docx_to_pdf reads. Returns the number newly converted."""
@@ -131,7 +144,9 @@ def convert_docx_batch(blobs: list[bytes], cfg: Config) -> int:
             src = Path(tmp) / f"{digest}.docx"
             src.write_bytes(data)
             srcs.append(src)
-        _run_soffice(cfg, srcs, tmp)
+        # chunked: one call per DOCX_BATCH files keeps the command line under Windows' 32k limit
+        for i in range(0, len(srcs), DOCX_BATCH):
+            _convert(cfg, srcs[i:i + DOCX_BATCH], tmp)
         for src in srcs:
             out = src.with_suffix(".pdf")
             if out.is_file():
@@ -151,7 +166,7 @@ def _docx_to_pdf(data: bytes, cfg: Config) -> bytes:
     with tempfile.TemporaryDirectory(prefix="docx2pdf_") as tmp:
         src = Path(tmp) / f"{digest}.docx"
         src.write_bytes(data)
-        _run_soffice(cfg, [src], tmp)
+        _convert(cfg, [src], tmp)
         out = src.with_suffix(".pdf")
         if not out.is_file():
             raise ExtractionError("soffice produced no PDF")
