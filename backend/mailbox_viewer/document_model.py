@@ -4,6 +4,10 @@
   ``backend/attachment_classifier/``, weights in ``ATTACHMENT_MODEL_DIR``.
 * Body model: Laya (convaiinnovations/laya), loader files and weights in
   ``BODY_MODEL_DIR``.
+* Intent model, tier 1: Laya typed-decisions in ``LAYA_DIR/LAYA_CHECKPOINT``
+  (optional; see ``intent.py``). Tier 2 is a llama.cpp server, not loaded here.
+  Both Laya folders import ``rl_agent_api`` by name, so the first one loaded
+  provides that loader code; keep the two folders on the same Laya version.
 
 Both load only from local folders. Hugging Face offline mode and telemetry
 are forced off in ``mailbox_viewer/__init__.py`` before any of this is
@@ -29,6 +33,8 @@ from .classifier import (
     model_content_type,
 )
 from .config import Settings
+from .intent import QUESTION as INTENT_QUESTION
+from .intent import IntentError, IntentStage, LlamaServerTier2, Tier1Result, checked_tier1
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +108,69 @@ class LayaBodyModel:
         return float(answer["noul"])
 
 
+class LayaIntentModel:
+    """Intent tier 1: Laya typed-decisions answering one ``choice`` question
+    over the 8 intents. Loaded once per process; calls are serialised on the
+    classifier's model thread because RLAgent is not documented as thread-safe."""
+
+    name = "laya-intent"
+
+    def __init__(self, laya_dir: Path, checkpoint: str) -> None:
+        laya_dir = laya_dir.resolve()
+        missing = [f for f in laya_intent_files(checkpoint) if not (laya_dir / f).is_file()]
+        if missing:
+            raise IntentError(
+                f"LAYA_DIR {laya_dir} is missing {', '.join(missing)}; download them as described in the "
+                "README section 'Intent of payment emails', or unset LAYA_DIR to turn intent classification off"
+            )
+        if str(laya_dir) not in sys.path:
+            sys.path.insert(0, str(laya_dir))  # rl_agent_api imports rl_common by bare name
+        from email_utils import clean_email_body  # type: ignore[import-not-found]
+        from rl_agent_api import RLAgent  # type: ignore[import-not-found]
+
+        self.clean = clean_email_body
+        self._agent = RLAgent(str(laya_dir / checkpoint), device=None)  # cpu or cuda, chosen by Laya
+
+    def classify(self, state) -> Tier1Result:
+        answer = self._agent.system_one(dict(state), INTENT_QUESTION)["answers"]["intent"]
+        # rl_agent.act_probability is deliberately ignored: it is 1.0 for every input.
+        return checked_tier1(answer["choice"], answer["probabilities"], answer["confidence"])
+
+
+def laya_intent_files(checkpoint: str) -> list[str]:
+    """Every file the intent step needs under LAYA_DIR (specification section 3a)."""
+    return ["rl_agent_api.py", "rl_common.py", "email_utils.py"] + [
+        f"{checkpoint}/{f}" for f in ("model.safetensors", "rl_agent_config.json", "encoder/config.json",
+                                      "tokenizer/tokenizer.json", "tokenizer/tokenizer_config.json")
+    ]
+
+
+def load_intent_stage(settings: Settings) -> IntentStage | None:
+    """The intent step, or None when LAYA_DIR is not set. A LAYA_DIR with
+    missing files is an error: it fails start-up instead of silently skipping."""
+    if not settings.laya_dir:
+        logger.warning("LAYA_DIR not set; payment emails will not get an intent")
+        return None
+    logger.info("loading intent model (Laya %s) from %s", settings.laya_checkpoint, settings.laya_dir)
+    tier1 = LayaIntentModel(Path(settings.laya_dir), settings.laya_checkpoint)
+    tier2 = None
+    if settings.tier2_enabled:
+        tier2 = LlamaServerTier2(settings.tier2_url, settings.tier2_timeout_s, settings.tier2_max_tokens,
+                                 settings.tier2_temperature)
+        if not tier2.healthy():
+            logger.warning("intent tier 2 server not reachable at %s; unsure emails will fall back to tier 1 "
+                           "for review until it is running", settings.tier2_url)
+    return IntentStage(
+        tier1=tier1,
+        tier2=tier2,
+        min_confidence=settings.tier1_min_confidence,
+        tier2_enabled=settings.tier2_enabled,
+        tier2_inline=settings.tier2_inline,
+        clean=tier1.clean,
+        max_chars=settings.email_body_max_chars,
+    )
+
+
 def load_classifier(settings: Settings) -> EmailClassifier:
     return EmailClassifier(
         body_model=_load_body_model(settings),
@@ -109,6 +178,7 @@ def load_classifier(settings: Settings) -> EmailClassifier:
         min_confidence=settings.model_min_confidence,
         body_min_confidence=settings.body_min_confidence,
         decides_above=settings.attachment_decides_confidence,
+        intent=load_intent_stage(settings),
     )
 
 

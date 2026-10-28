@@ -6,7 +6,7 @@ import pandas as pd
 import streamlit as st
 
 from api_client import ApiError
-from ui import DECISION_ICONS, fmt, get_api
+from ui import DECISION_ICONS, INTENT_LABELS, fmt, get_api
 
 api = get_api()
 st.title("📬 Statement Recon · Mailbox Viewer")
@@ -66,6 +66,34 @@ with right:
         st.bar_chart(kinds, x="document type", y="emails", horizontal=True, color="#6d706b", height=220)
     else:
         st.info("No stored emails yet.")
+
+if profile.get("intent_model"):
+    st.divider()
+    st.subheader("What payment emails are for")
+    try:
+        intents = api.intent_summary()
+    except ApiError as exc:
+        st.warning(str(exc))
+        intents = None
+    if intents and intents["total"]:
+        left, right = st.columns([3, 2])
+        with left:
+            frame = pd.DataFrame(
+                [(INTENT_LABELS.get(k, k), v) for k, v in sorted(intents["by_intent"].items(), key=lambda kv: -kv[1])],
+                columns=["intent", "emails"],
+            )
+            st.bar_chart(frame, x="intent", y="emails", horizontal=True, color="#5b8def", height=260)
+        with right:
+            a, b = st.columns(2)
+            a.metric("With an intent", intents["total"])
+            b.metric("Needs review", intents["needs_review"])
+            a.metric("Waiting for DeepSeek", intents["pending"])
+            decided = intents["by_decided_by"]
+            b.metric("Decided by DeepSeek", decided.get("tier2", 0))
+            st.caption(f"Laya decides at confidence ≥ {profile['tier1_min_confidence']:.2f}; below that DeepSeek "
+                       f"decides ({profile['tier2']}). Model: {profile['intent_model']}.")
+    else:
+        st.info("No payment email has an intent yet. New payment emails get one on the next Refresh.")
 
 st.divider()
 left, right = st.columns(2)

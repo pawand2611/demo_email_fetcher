@@ -32,19 +32,21 @@ from mailbox_viewer.classifier import PAYMENT_LABELS
 from mailbox_viewer.config import Settings, load_settings
 from mailbox_viewer.db import init_db, make_engine, make_session_factory
 from mailbox_viewer.document_model import load_classifier
+from mailbox_viewer.intent import INTENT_KEYS
+from mailbox_viewer.intent_jobs import resolve_pending_intents
 from mailbox_viewer.mail_client import MailClient
 from mailbox_viewer.models import Base
 from mailbox_viewer.sync import ClientFactory, SyncResult, run_sync
 from mailbox_viewer.timeutil import to_ist
 
 from . import schemas as s
-from .jobs import KIND_RECLASSIFY, KIND_REDECIDE, KIND_SYNC, KIND_TICKETS, Job, Jobs
+from .jobs import KIND_INTENTS, KIND_RECLASSIFY, KIND_REDECIDE, KIND_SYNC, KIND_TICKETS, Job, Jobs
 
 logger = logging.getLogger(__name__)
 
 DIALECTS = {"sqlite": sqlite.dialect(), "postgresql": postgresql.dialect()}
 TABLE_ORDER = ["threads", "emails", "email_participants", "attachments", "sync_state", "decision_log",
-               "tickets", "ticket_events"]
+               "tickets", "ticket_events", "email_intents"]
 
 
 @dataclass
@@ -98,6 +100,10 @@ def create_app(services: Services | None = None) -> FastAPI:
                                 svc.settings.ticket_close_confidence)
         return {"changed": sum(totals.values()), **totals}
 
+    def run_intents_job(retry_failed: bool) -> dict:
+        stage = svc.classifier.intent
+        return resolve_pending_intents(svc.session_factory, stage.tier2, svc.settings.tier2_max_per_job, retry_failed)
+
     def start_job(kind: str, run) -> s.JobOut:
         job, started = jobs.start(kind, run)
         if not started and job.kind != kind:
@@ -107,7 +113,7 @@ def create_app(services: Services | None = None) -> FastAPI:
     app = FastAPI(
         title="Mailbox Viewer API",
         version="1.0",
-        description="Syncs a mailbox into the cache, classifies each email with two local models (Laya on the body, LayoutLMv3 on attachments) through a LangGraph flow, and serves the results.",
+        description="Syncs a mailbox into the cache, classifies each email with two local models (Laya on the body, LayoutLMv3 on attachments) through a LangGraph flow, gives payment emails an intent (Laya, then a local DeepSeek for unsure ones), and serves the results.",
     )
     app.state.services = svc
     app.state.jobs = jobs
@@ -126,6 +132,7 @@ def create_app(services: Services | None = None) -> FastAPI:
     @app.get("/profiles", response_model=list[s.ProfileOut], tags=["service"])
     def profiles() -> list[s.ProfileOut]:
         st_ = svc.settings
+        stage = svc.classifier.intent
         return [
             s.ProfileOut(
                 name=st_.profile_name,
@@ -140,6 +147,10 @@ def create_app(services: Services | None = None) -> FastAPI:
                 ticket_close_confidence=st_.ticket_close_confidence,
                 payment_labels=sorted(PAYMENT_LABELS),
                 attachment_store=svc.store.describe(),
+                intent_model=stage.name if stage else None,
+                intent_labels=list(INTENT_KEYS),
+                tier1_min_confidence=stage.min_confidence if stage else None,
+                tier2=("inline" if stage.tier2_inline else "background") if stage and stage.tier2_active else "off",
             )
         ]
 
@@ -194,6 +205,22 @@ def create_app(services: Services | None = None) -> FastAPI:
         """Recreate every ticket from the stored payment threads. Runs the body model on
         replies in open tickets; manual changes are not kept."""
         return start_job(KIND_TICKETS, run_tickets_job)
+
+    @app.post("/intents/tier2", response_model=s.JobOut, status_code=202, tags=["jobs", "intents"])
+    def resolve_intents(retry_failed: bool = False) -> s.JobOut:
+        """Run intent tier 2 (DeepSeek) on emails tier 1 was unsure about, up to
+        TIER2_MAX_PER_JOB of them (~100 s each on CPU). ``retry_failed`` also
+        retries emails whose tier-2 call timed out or found no server."""
+        stage = svc.classifier.intent
+        if stage is None or not stage.tier2_active:
+            raise HTTPException(503, "intent tier 2 is not enabled (set LAYA_DIR and TIER2_ENABLED=true)")
+        return start_job(KIND_INTENTS, lambda: run_intents_job(retry_failed))
+
+    @app.get("/intents/summary", response_model=s.IntentSummaryOut, tags=["intents"])
+    def intent_summary() -> s.IntentSummaryOut:
+        """Share decided by each tier, tier-2 outcomes and latency, review rate, intent distribution."""
+        with svc.session_factory() as session:
+            return s.IntentSummaryOut(**repo.intent_summary(session))
 
     @app.get("/sync/latest", response_model=s.JobOut | None, tags=["jobs"])
     def latest_sync() -> s.JobOut | None:
@@ -428,7 +455,12 @@ def _message_out(d: repo.EmailDetail, decision: repo.DecisionInfo | None) -> s.M
             for a in d.attachments
         ],
         decision=_decision_out(decision) if decision else None,
+        intent=_intent_out(d.intent) if d.intent else None,
     )
+
+
+def _intent_out(i: repo.IntentInfo) -> s.IntentOut:
+    return s.IntentOut(**{**dataclasses.asdict(i), "decided_at": _ist(i.decided_at)})
 
 
 def _job_out(job: Job) -> s.JobOut:

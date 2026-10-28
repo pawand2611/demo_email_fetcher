@@ -14,7 +14,7 @@ from mailbox_viewer.db import init_db, make_engine
 from mailbox_viewer.models import Attachment, Base
 
 EXPECTED_TABLES = {"threads", "emails", "email_participants", "attachments", "sync_state", "decision_log",
-                   "tickets", "ticket_events"}
+                   "tickets", "ticket_events", "email_intents"}
 
 
 class SchemaTests(unittest.TestCase):

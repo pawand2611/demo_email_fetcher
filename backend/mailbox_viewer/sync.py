@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Protocol
 
 from sqlalchemy.exc import IntegrityError
@@ -31,10 +31,11 @@ from sqlalchemy.orm import Session, sessionmaker
 from . import repository as repo
 from . import tickets
 from .attachment_store import AttachmentStoreError, FileSystemStore, build_store
-from .classification_graph import EmailClassifier
+from .classification_graph import Classification, EmailClassifier
 from .classifier import Decision, EmailInput
 from .config import Settings
 from .document_model import load_classifier
+from .intent import log_decision as log_intent
 from .mail_client import MailClient, MailClientError, MailConnectionLost
 from .mail_parser import ParsedEmail, parse_message
 from .models import Email, to_naive_utc
@@ -88,6 +89,8 @@ class SyncResult:
     failed: int = 0
     tickets_opened: int = 0
     tickets_closed: int = 0
+    intents: int = 0  # payment emails that got an intent
+    intents_pending: int = 0  # of those, waiting for intent tier 2
     error: str | None = None
     duration_seconds: float = 0.0
 
@@ -102,6 +105,8 @@ class SyncResult:
         )
         if self.tickets_opened or self.tickets_closed:
             text += f"; tickets: {self.tickets_opened} opened, {self.tickets_closed} closed"
+        if self.intents:
+            text += f"; intents: {self.intents} classified, {self.intents_pending} waiting for tier 2"
         if self.error:
             text += f" ({self.status}: {self.error})"
         return text
@@ -222,8 +227,9 @@ class _Processor:
         self.mailbox = mailbox
         self.ticket_close_at = ticket_close_at
 
-    def _classify(self, mail: ParsedEmail) -> Decision:
-        return self.classifier.classify(EmailInput.from_parsed(mail))
+    def _classify(self, mail: ParsedEmail, inherited: bool = False) -> Classification:
+        """The LangGraph flow: payment decision, then intent for payment emails."""
+        return self.classifier.run(EmailInput.from_parsed(mail), inherited=inherited)
 
     def process(self, uid: int) -> None:
         try:
@@ -273,9 +279,10 @@ class _Processor:
 
         # Step 4: classify; every message gets a decision line. A later email of a
         # thread already classified as payment inherits it (Laya skipped,
-        # attachments still labelled by LayoutLMv3).
-        email = EmailInput.from_parsed(mail)
-        decision = self.classifier.inherit(email) if in_payment_thread else self._classify(mail)
+        # attachments still labelled by LayoutLMv3). Every payment email, by the
+        # models or inherited, also gets an intent in the same flow.
+        outcome = self._classify(mail, inherited=in_payment_thread)
+        decision = outcome.decision
 
         # Step 5: keep?
         # Review emails are kept too: dropped ones are never fetched again, so a
@@ -289,20 +296,26 @@ class _Processor:
         # A reply in a thread with an open ticket: does it confirm the payment?
         # One extra body-model call, outside any transaction.
         confirmation = self.classifier.payment_confirmation(mail.subject, mail.body_text) if ticket_active else None
-        self._store(mail, decision, confirmation=confirmation, update_ticket=True)
+        self._store(mail, outcome, confirmation=confirmation, update_ticket=True)
         if decision.matched_directly and self.store_only_payment:
             self._backfill_ancestors(mail)
         return "payment" if decision.matched_directly else "kept"
 
-    def _store(self, mail: ParsedEmail, decision: Decision, confirmation: float | None = None,
+    def _store(self, mail: ParsedEmail, outcome: Classification, confirmation: float | None = None,
                update_ticket: bool = False) -> None:
+        decision = outcome.decision
         # Files go to the store first, between transactions, so a slow disk
         # never holds the database write lock while the UI is reading.
         blob_keys = [self.store.put(sha256=a.sha256, filename=a.filename, data=a.data) for a in mail.attachments]
         with self.session_factory() as session, session.begin():
-            email_id = repo.insert_email(session, mail, decision, blob_keys)
+            email_id = repo.insert_email(session, mail, decision, blob_keys,
+                                         intent=outcome.intent, intent_input=outcome.intent_input)
             if update_ticket:
                 self._update_ticket(session, email_id, mail, decision, confirmation)
+        if outcome.intent is not None:
+            log_intent(mail.message_id, outcome.intent)
+            self.result.intents += 1
+            self.result.intents_pending += int(outcome.intent.pending)
 
     def _update_ticket(self, session, email_id: int, mail: ParsedEmail, decision: Decision,
                        confirmation: float | None) -> None:
@@ -334,10 +347,11 @@ class _Processor:
                     continue
                 raw, internal_date = self.client.fetch_message(uid)
                 earlier = parse_message(uid, raw, internal_date)
-                earlier_decision = self._classify(earlier)
-                if not earlier_decision.is_payment:
-                    earlier_decision = earlier_decision.with_note("backfilled into a payment thread")
-                self._store(earlier, earlier_decision)
+                earlier_outcome = self._classify(earlier)
+                if not earlier_outcome.decision.is_payment:
+                    earlier_outcome = replace(earlier_outcome,
+                                              decision=earlier_outcome.decision.with_note("backfilled into a payment thread"))
+                self._store(earlier, earlier_outcome)
                 self.result.backfilled += 1
             except MailConnectionLost:
                 raise

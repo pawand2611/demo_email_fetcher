@@ -16,6 +16,9 @@ Ownership:
 * ``tickets``            one per payment thread: open, in progress or closed,
                          with when it opened and what closed it.
 * ``ticket_events``      every status change of a ticket, automatic or manual.
+* ``email_intents``      what a payment email is for (new invoice, reminder,
+                         confirmation, ...), which tier decided, and whether a
+                         human should review it.
 
 Datetimes are naive UTC (SQLite has no timezone-aware type; PostgreSQL gets
 TIMESTAMP WITHOUT TIME ZONE). The same models compile to both dialects.
@@ -26,6 +29,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from sqlalchemy import (
+    JSON,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -37,6 +41,8 @@ from sqlalchemy import (
     Text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+from .intent import DECIDED_BY, INTENT_KEYS, TIER2_STATUSES
 
 PARTICIPANT_ROLES = ("from", "to", "cc", "bcc")
 DOC_TYPES = ("statement", "invoice", "receipt", "other")
@@ -103,6 +109,9 @@ class Email(Base):
     )
     attachments: Mapped[list[Attachment]] = relationship(
         back_populates="email", cascade="all, delete-orphan", order_by="Attachment.id"
+    )
+    intent: Mapped[EmailIntent | None] = relationship(
+        back_populates="email", cascade="all, delete-orphan", uselist=False
     )
 
 
@@ -210,3 +219,44 @@ class TicketEvent(Base):
     confidence: Mapped[float | None] = mapped_column(Float)
 
     ticket: Mapped[Ticket] = relationship(back_populates="events")
+
+
+def _sql_in(values: tuple[str, ...]) -> str:
+    return ", ".join(f"'{v}'" for v in values)
+
+
+class EmailIntent(Base):
+    """What a payment email is for (intent.py): one row per stored payment email.
+
+    The CHECK constraints guarantee that no label outside the 8 intents is ever
+    stored. ``tier2_input`` holds the cleaned email state only while tier 2 is
+    still to run (or failed and may be retried); it is cleared once tier 2 has
+    answered."""
+
+    __tablename__ = "email_intents"
+    __table_args__ = (
+        CheckConstraint(f"intent IN ({_sql_in(INTENT_KEYS)})", name="ck_email_intents_intent"),
+        CheckConstraint(f"tier1_intent IN ({_sql_in(INTENT_KEYS)})", name="ck_email_intents_tier1_intent"),
+        CheckConstraint(f"tier2_intent IS NULL OR tier2_intent IN ({_sql_in(INTENT_KEYS)})",
+                        name="ck_email_intents_tier2_intent"),
+        CheckConstraint(f"decided_by IN ({_sql_in(DECIDED_BY)})", name="ck_email_intents_decided_by"),
+        CheckConstraint(f"tier2_status IS NULL OR tier2_status IN ({_sql_in(TIER2_STATUSES)})",
+                        name="ck_email_intents_tier2_status"),
+        CheckConstraint("tier1_confidence >= 0 AND tier1_confidence <= 1", name="ck_email_intents_tier1_confidence"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    email_id: Mapped[int] = mapped_column(ForeignKey("emails.id", ondelete="CASCADE"), unique=True, nullable=False)
+    intent: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    decided_by: Mapped[str] = mapped_column(String(16), nullable=False)
+    needs_review: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
+    tier1_intent: Mapped[str] = mapped_column(String(32), nullable=False)
+    tier1_confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    tier1_probabilities: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    tier2_intent: Mapped[str | None] = mapped_column(String(32))
+    tier2_status: Mapped[str | None] = mapped_column(String(16), index=True)
+    tier2_seconds: Mapped[float | None] = mapped_column(Float)
+    tier2_input: Mapped[dict | None] = mapped_column(JSON)
+    decided_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow_naive)
+
+    email: Mapped[Email] = relationship(back_populates="intent")

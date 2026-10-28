@@ -27,6 +27,16 @@ TICKET_STATUS = {"open": ("🔴 Open", "red"), "in_progress": ("🟠 In progress
 TICKET_EVENTS = {"opened": "Opened", "in_progress": "In progress", "closed": "Closed", "reopened": "Reopened"}
 TIERS = "0 nothing classified · 1 attachment model · 2 body model · 3 both models"
 
+INTENT_LABELS = {
+    "new_invoice": "New invoice", "payment_reminder": "Payment reminder", "payment_confirmation": "Payment confirmation",
+    "credit_note": "Credit note", "dispute_query": "Dispute / query", "partial_payment": "Partial payment",
+    "cancellation": "Cancellation", "other": "Other",
+}
+INTENT_COLORS = {"new_invoice": "violet", "payment_reminder": "orange", "payment_confirmation": "green",
+                 "credit_note": "blue", "dispute_query": "red", "partial_payment": "orange", "cancellation": "gray",
+                 "other": "gray"}
+INTENT_DECIDED_BY = {"tier1": "Laya (tier 1)", "tier2": "DeepSeek (tier 2)", "tier1_fallback": "Laya, tier 2 failed"}
+
 
 # -- API access with a short cache ------------------------------------------------------------
 #
@@ -37,8 +47,9 @@ TIERS = "0 nothing classified · 1 attachment model · 2 body model · 3 both mo
 
 CACHE_SECONDS = 60
 _READS = {"health", "profiles", "stats", "threads", "thread", "tickets", "ticket", "table_rows", "tables",
-          "schema", "ddl", "latest_sync"}
-_WRITES = {"start_sync", "reclassify", "redecide", "rebuild_tickets", "close_ticket", "reopen_ticket"}
+          "schema", "ddl", "latest_sync", "intent_summary"}
+_WRITES = {"start_sync", "reclassify", "redecide", "rebuild_tickets", "close_ticket", "reopen_ticket",
+           "resolve_intents"}
 
 
 @st.cache_resource(show_spinner=False)
@@ -139,6 +150,17 @@ def render_sidebar(api: CachedApi) -> None:
                               "Manual closes and reopens are not kept."):
                 run_job(api, "Rebuilding tickets from stored mail…", api.rebuild_tickets)
 
+        if profile.get("tier2", "off") != "off":
+            with st.expander("Intent tier 2"):
+                st.caption("Payment emails whose intent Laya was unsure about wait for DeepSeek. "
+                           "Each takes about 100 seconds on CPU; other jobs wait meanwhile.")
+                retry = st.toggle("Also retry failed", value=False,
+                                  help="Retry emails whose tier-2 call timed out or found no server")
+                if st.button("🤖 Resolve unsure intents", width="stretch",
+                             help="Run DeepSeek on the next batch of emails waiting for intent tier 2"):
+                    run_job(api, "DeepSeek is classifying the unsure intents…",
+                            lambda: api.resolve_intents(retry_failed=retry))
+
         job = st.session_state.get("last_job")
         if job is not None:
             show_job(job)
@@ -167,6 +189,9 @@ def show_job(job: dict) -> None:
         status = result.get("status")
         text = f"Synced in {result.get('duration_seconds', 0)}s: {result.get('summary', '')}"
         (st.success if status == "ok" else st.warning if status == "partial" else st.error)(text)
+    elif job["kind"] == "intents":
+        st.success(f"Intent tier 2: {result.get('tier2', 0)} decided by DeepSeek, {result.get('fallback', 0)} kept "
+                   f"Laya's answer for review; {result.get('remaining', 0)} still waiting.")
     elif job["kind"] == "tickets":
         st.success(f"Tickets rebuilt: {result.get('opened', 0)} opened, {result.get('in_progress', 0)} in progress, "
                    f"{result.get('closed', 0)} closed.")

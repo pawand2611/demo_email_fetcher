@@ -25,6 +25,7 @@ KIND_SYNC = "sync"
 KIND_RECLASSIFY = "reclassify"
 KIND_REDECIDE = "redecide"
 KIND_TICKETS = "tickets"
+KIND_INTENTS = "intents"
 
 
 @dataclass

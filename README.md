@@ -142,6 +142,8 @@ python sync_mail.py                    # one sync run, prints counts before/afte
 python sync_mail.py --reset-state      # forget the resume point and re-walk (still 0 new)
 python sync_mail.py --reclassify       # re-run both models over the cache (slow)
 python sync_mail.py --redecide         # re-apply the decision rule to stored predictions (fast)
+python sync_mail.py --intents-tier2    # run intent tier 2 (DeepSeek) on emails waiting for it
+python sync_mail.py --intents-tier2 --retry-failed   # ...and retry timed-out / unreachable ones
 python -m unittest -v                  # backend tests, no mailbox needed
 ```
 
@@ -248,6 +250,89 @@ it is weaker (for example real invoice replies labelled "purchase order"),
 which the 0.7 bar, the review state and the attachment-first rule
 compensate for until it is fine-tuned.
 
+## Intent of payment emails
+
+Every payment email, whether the models decided it or it inherited payment
+from its thread, also gets an **intent**: what the email is for. The labels,
+prompt and rules are in `backend/mailbox_viewer/intent.py`.
+
+| Intent | Meaning |
+|---|---|
+| `new_invoice` | a first bill for a charge, sent for payment |
+| `payment_reminder` | a reminder about an upcoming or overdue payment due date |
+| `payment_confirmation` | confirms a payment was received, or sends a receipt |
+| `credit_note` | a refund, credit memo or billing correction |
+| `dispute_query` | a question about, or a discrepancy flagged on, a bill |
+| `partial_payment` | acknowledges or announces that only part of the amount was paid |
+| `cancellation` | an invoice was voided, withdrawn or cancelled |
+| `other` | anything else, for human review |
+
+It is two more steps in the same LangGraph flow:
+
+```
+combine / inherit ─(payment)─> intent_tier1 (Laya) ─┬─(confidence ≥ 0.4)──────────────> END
+                                                    ├─(unsure, TIER2_INLINE=false)────> END, stored as "pending"
+                                                    └─(unsure, TIER2_INLINE=true)─> intent_tier2 (DeepSeek) ─> END
+```
+
+- **Tier 1, Laya typed-decisions** runs during the sync, in about 1.6 seconds
+  per email on CPU. At or above `TIER1_MIN_CONFIDENCE` (0.4) its answer is final.
+- **Tier 2, DeepSeek-R1-Distill-Llama-8B** runs on a local llama.cpp server and
+  decides the emails tier 1 is unsure about. It takes about 100 seconds per
+  email on CPU, so the email is stored at once as `pending`.
+  - The sidebar's **🤖 Resolve unsure intents** button runs tier 2 on the next
+    `TIER2_MAX_PER_JOB` waiting emails. So do `POST /intents/tier2` and
+    `sync_mail.py --intents-tier2`.
+  - With a GPU, `TIER2_INLINE=true` runs it inside the sync instead.
+- **If tier 2 is off, unreachable, times out or gives no valid label,** Laya's
+  answer stands and `needs_review` is set. A final `other` always needs review.
+  Timed-out or unreachable emails can be retried with "Also retry failed".
+- **Results** go to the `email_intents` table and appear in the Inbox, on an
+  Intent tab per message, and on the Overview. `GET /intents/summary` gives the
+  monitoring numbers.
+- **Email content never leaves the machine.** `TIER2_URL` must be a localhost
+  address. The state sent to tier 2 is from, to, subject and the cleaned body,
+  never attachment names. The body is kept in the database only until tier 2
+  has answered.
+
+Setup, once. The files are about 5 GB in total, and none go into git:
+
+1. **Laya typed-decisions,** about 808 MB, Apache-2.0. Download it into one
+   folder and set `LAYA_DIR` to that folder. A missing file stops the backend
+   at start-up with the file's name. With `curl`, which also works where Python
+   cannot reach the Hub because of TLS inspection, run this in Git Bash:
+
+   ```bash
+   LAYA_DIR=backend/models/laya_intent
+   base=https://huggingface.co/convaiinnovations/laya/resolve/main
+   for f in rl_agent_api.py rl_common.py email_utils.py; do curl -L --fail --create-dirs -o "$LAYA_DIR/$f" "$base/$f"; done
+   for f in model.safetensors rl_agent_config.json encoder/config.json tokenizer/tokenizer.json tokenizer/tokenizer_config.json; do
+     curl -L --fail --create-dirs -o "$LAYA_DIR/typed-decisions/$f" "$base/typed-decisions/$f"; done
+   ```
+
+   The body model in `BODY_MODEL_DIR` and this one both import Laya's
+   `rl_agent_api` by name, so keep the two folders on the same Laya version.
+2. **DeepSeek,** about 4.4 GB. Download
+   `DeepSeek-R1-Distill-Llama-8B-Q4_K_S.gguf` from
+   `bartowski/DeepSeek-R1-Distill-Llama-8B-GGUF`, and a prebuilt `llama-server`
+   from the llama.cpp releases. Run it as its own long-lived process, bound to
+   localhost:
+
+   ```powershell
+   llama-server -m <path>\DeepSeek-R1-Distill-Llama-8B-Q4_K_S.gguf --host 127.0.0.1 --port 8080 `
+                -c 4096 -np 1 -t <physical cores> --jinja --reasoning-format deepseek
+   ```
+
+   It needs about 8 GB of RAM. The licence is MIT plus the Llama 3.1 Community
+   Licence, so check with legal before production use.
+
+To run the slow real-model tests: set `LAYA_DIR`, and set `TIER2_URL_TEST` to a
+running llama-server.
+
+Caution: the measured accuracy figures come from 320 synthetic emails, and
+tier 2 was tested on only 18 emails. Expect lower accuracy on real mail until
+both tiers are measured on labelled real emails.
+
 ## Layout
 
 ```
@@ -262,11 +347,14 @@ backend/                      the API service: the only part that touches mail, 
     mail_parser.py            raw bytes -> ParsedEmail (headers, participants, bodies, attachments)
     threads.py                conversation key from threading headers
     classifier.py             the two classification steps and the decision rule
-    classification_graph.py   LangGraph flow: attachments first, body model only when needed
-    document_model.py         loads Laya and LayoutLMv3 from backend/models/
+    classification_graph.py   LangGraph flow: attachments first, body model only when needed, then intent
+    document_model.py         loads Laya (body and intent) and LayoutLMv3 from backend/models/
+    intent.py                 intent labels, tier-2 prompt and parser, router, llama.cpp client
+    intent_jobs.py            intent tier 2 as a background job: drains the pending queue
     attachment_store.py       file-system store for attachment bytes
     models.py                 SQLAlchemy models: threads, emails, email_participants,
-                              attachments, sync_state, decision_log
+                              attachments, sync_state, decision_log, tickets,
+                              ticket_events, email_intents
     db.py                     engine / session factory
     repository.py             every database read and write
     tickets.py                aging tickets: open, in progress, close, reopen, age

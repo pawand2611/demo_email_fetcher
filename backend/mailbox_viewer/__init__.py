@@ -18,6 +18,7 @@ for _key, _value in {
     "TRANSFORMERS_OFFLINE": "1",
     "HF_HUB_DISABLE_TELEMETRY": "1",
     "HF_HUB_DISABLE_PROGRESS_BARS": "1",
+    "USE_TF": "0",  # transformers can deadlock probing TensorFlow (Laya intent model)
     "LANGSMITH_TRACING": "false",
     "LANGCHAIN_TRACING_V2": "false",
     "LANGSMITH_API_KEY": "",

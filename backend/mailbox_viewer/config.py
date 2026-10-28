@@ -50,6 +50,20 @@ class Settings:
     profile_name: str = "statement_recon"
     # Tickets: a reply that Laya scores at least this sure is a payment confirmation closes the ticket.
     ticket_close_confidence: float = 0.8
+    # Intent classification of payment emails (intent.py). LAYA_DIR unset = intent off.
+    laya_dir: str | None = None
+    laya_checkpoint: str = "typed-decisions"
+    tier1_min_confidence: float = 0.4
+    tier2_enabled: bool = True
+    tier2_url: str = "http://127.0.0.1:8080"
+    tier2_timeout_s: float = 900.0  # CPU; about 60 on a GPU
+    tier2_max_tokens: int = 1536
+    tier2_temperature: float = 0.6
+    email_body_max_chars: int = 3000
+    # Tier 2 inside the classification flow (GPU only); otherwise a background job.
+    tier2_inline: bool = False
+    # Emails one tier-2 background job resolves before it ends (each takes ~100 s on CPU).
+    tier2_max_per_job: int = 10
 
     def __post_init__(self) -> None:
         if not self.imap_folders:
@@ -73,7 +87,20 @@ _DEFAULTS = {
     "BODY_MODEL_DIR": "models/laya",
     "PROFILE_NAME": "statement_recon",
     "TICKET_CLOSE_CONFIDENCE": "0.8",
+    "LAYA_CHECKPOINT": "typed-decisions",
+    "TIER1_MIN_CONFIDENCE": "0.4",
+    "TIER2_ENABLED": "true",
+    "TIER2_URL": "http://127.0.0.1:8080",
+    "TIER2_TIMEOUT_S": "900",
+    "TIER2_MAX_TOKENS": "1536",
+    "TIER2_TEMPERATURE": "0.6",
+    "EMAIL_BODY_MAX_CHARS": "3000",
+    "TIER2_INLINE": "false",
+    "TIER2_MAX_PER_JOB": "10",
 }
+
+# Email content may only go to a model on this machine.
+_LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 
 def load_settings(env_file: str | os.PathLike[str] | None = None) -> Settings:
@@ -120,6 +147,17 @@ def load_settings(env_file: str | os.PathLike[str] | None = None) -> Settings:
         attachment_decides_confidence=_get_fraction("ATTACHMENT_DECIDES_CONFIDENCE"),
         profile_name=_get("PROFILE_NAME") or "statement_recon",
         ticket_close_confidence=_get_fraction("TICKET_CLOSE_CONFIDENCE"),
+        laya_dir=_get("LAYA_DIR") or None,
+        laya_checkpoint=_get("LAYA_CHECKPOINT") or "typed-decisions",
+        tier1_min_confidence=_get_fraction("TIER1_MIN_CONFIDENCE"),
+        tier2_enabled=_get_bool("TIER2_ENABLED"),
+        tier2_url=_get_local_url("TIER2_URL"),
+        tier2_timeout_s=_get_positive_float("TIER2_TIMEOUT_S"),
+        tier2_max_tokens=_get_int("TIER2_MAX_TOKENS"),
+        tier2_temperature=_get_temperature("TIER2_TEMPERATURE"),
+        email_body_max_chars=_get_int("EMAIL_BODY_MAX_CHARS"),
+        tier2_inline=_get_bool("TIER2_INLINE"),
+        tier2_max_per_job=_get_int("TIER2_MAX_PER_JOB"),
     )
 
 
@@ -145,6 +183,39 @@ def _get_fraction(key: str) -> float:
     if not 0.0 <= value <= 1.0:
         raise ConfigError(f"{key} must be between 0 and 1, got {value}")
     return value
+
+
+def _get_positive_float(key: str) -> float:
+    raw = _get(key)
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ConfigError(f"{key} must be a number, got {raw!r}") from exc
+    if value <= 0:
+        raise ConfigError(f"{key} must be greater than 0, got {value}")
+    return value
+
+
+def _get_temperature(key: str) -> float:
+    raw = _get(key)
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ConfigError(f"{key} must be a number between 0 and 2, got {raw!r}") from exc
+    if not 0.0 <= value <= 2.0:
+        raise ConfigError(f"{key} must be between 0 and 2, got {value}")
+    return value
+
+
+def _get_local_url(key: str) -> str:
+    """A URL on this machine only: the tier-2 model reads email content."""
+    from urllib.parse import urlparse
+
+    raw = _get(key).rstrip("/")
+    parsed = urlparse(raw)
+    if parsed.scheme not in ("http", "https") or parsed.hostname not in _LOCAL_HOSTS:
+        raise ConfigError(f"{key} must be an http(s) URL on localhost (127.0.0.1, localhost or ::1), got {raw!r}")
+    return raw
 
 
 def _get_int(key: str) -> int:

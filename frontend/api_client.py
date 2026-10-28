@@ -73,6 +73,15 @@ class ApiClient:
         """Start re-applying the decision rules to stored scores (no models); returns the job."""
         return self._json("POST", "/redecide")
 
+    # -- intents ----------------------------------------------------------------------
+
+    def resolve_intents(self, *, retry_failed: bool = False) -> dict[str, Any]:
+        """Start intent tier 2 (DeepSeek) on the emails tier 1 was unsure about; returns the job."""
+        return self._json("POST", "/intents/tier2", params={"retry_failed": True} if retry_failed else None)
+
+    def intent_summary(self) -> dict[str, Any]:
+        return self._json("GET", "/intents/summary")
+
     # -- tickets ----------------------------------------------------------------------
 
     def tickets(self, status: str | None = None) -> list[dict[str, Any]]:

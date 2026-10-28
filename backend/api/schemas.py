@@ -28,6 +28,11 @@ class ProfileOut(BaseModel):
     ticket_close_confidence: float
     payment_labels: list[str]
     attachment_store: str
+    # Intent classification of payment emails; intent_model is None when LAYA_DIR is not set.
+    intent_model: str | None = None
+    intent_labels: list[str] = []
+    tier1_min_confidence: float | None = None
+    tier2: str = "off"  # off | background | inline
 
 
 class SyncStateOut(BaseModel):
@@ -85,6 +90,34 @@ class DecisionOut(BaseModel):
     decided_at: datetime
 
 
+class IntentOut(BaseModel):
+    """What a payment email is for, and which tier decided it."""
+
+    intent: str  # one of the 8 intent keys
+    decided_by: str  # tier1 | tier2 | tier1_fallback
+    needs_review: bool
+    tier1_intent: str
+    tier1_confidence: float
+    tier1_probabilities: dict[str, float]
+    tier2_intent: str | None
+    tier2_status: str | None  # pending | ok | unparsed | timeout | unavailable | None (not called)
+    tier2_seconds: float | None
+    decided_at: datetime
+
+
+class IntentSummaryOut(BaseModel):
+    total: int
+    needs_review: int
+    pending: int
+    by_intent: dict[str, int]
+    by_decided_by: dict[str, int]
+    by_tier2_status: dict[str, int]
+    tier2_failure_rate: float | None
+    tier2_seconds_p50: float | None
+    tier2_seconds_p90: float | None
+    tier2_seconds_max: float | None
+
+
 class MessageOut(BaseModel):
     id: int
     message_id: str
@@ -101,6 +134,7 @@ class MessageOut(BaseModel):
     participants: list[ParticipantOut]
     attachments: list[AttachmentOut]
     decision: DecisionOut | None
+    intent: IntentOut | None = None  # payment emails only
 
 
 class ThreadOut(BaseModel):
@@ -138,6 +172,8 @@ class SyncResultOut(BaseModel):
     failed: int
     tickets_opened: int = 0
     tickets_closed: int = 0
+    intents: int = 0
+    intents_pending: int = 0
     error: str | None
     duration_seconds: float
     summary: str
@@ -154,7 +190,7 @@ class JobOut(BaseModel):
     ``sync`` and the ReclassifyOut fields for kind ``reclassify``."""
 
     id: str
-    kind: str  # sync | reclassify
+    kind: str  # sync | reclassify | redecide | tickets | intents
     state: str  # running | succeeded | failed
     started_at: datetime
     finished_at: datetime | None
