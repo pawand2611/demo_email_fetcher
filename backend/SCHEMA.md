@@ -180,6 +180,29 @@ One aging ticket per payment thread (`tickets.py`):
 Age: open and in-progress tickets age until now, closed ones stop at the close.
 Buckets: 0–2, 3–7 and 8+ days.
 
+## Intents
+
+`email_intents` holds one row per stored payment email, whether the payment
+was decided by the models or inherited. It records what the email is for
+(`intent.py`), with these columns:
+
+| Column | Meaning |
+|---|---|
+| `intent` | the final label, one of 8: new_invoice, payment_reminder, payment_confirmation, credit_note, dispute_query, partial_payment, cancellation, other |
+| `decided_by` | `tier1` (Laya), `tier2` (DeepSeek) or `tier1_fallback` (tier 2 off, unreachable, timed out or unparsed) |
+| `needs_review` | true for any fallback, for a final `other`, and while tier 2 is pending |
+| `tier1_intent`, `tier1_confidence`, `tier1_probabilities` | Laya's answer, its confidence (1 - normalised entropy) and all 8 probabilities |
+| `tier2_intent`, `tier2_status`, `tier2_seconds` | DeepSeek's answer; status `pending`, `ok`, `unparsed`, `timeout`, `unavailable`, or NULL when not called |
+| `tier2_input` | the cleaned email state (from, to, subject, body) tier 1 classified; kept only while tier 2 is pending or may be retried, then cleared |
+
+CHECK constraints allow only the 8 labels, so nothing else can reach
+downstream systems. The row is deleted with its email (`ON DELETE CASCADE`).
+Re-classify recomputes it. Re-decide removes it when an email is no longer
+payment; it cannot compute a new intent, because it runs no models.
+
+The table is new, and `init_db` creates it in an existing database. No other
+table changes.
+
 ## Attachments
 
 Bytes live under `ATTACHMENT_DIR/<sha256>/<filename>` (default

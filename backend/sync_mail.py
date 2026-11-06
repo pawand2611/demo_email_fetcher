@@ -9,6 +9,9 @@ Usage:
                                        # (still adds no duplicate rows)
     python sync_mail.py --reclassify   # re-run both models over the cache
                                        # only; no mail-server contact
+    python sync_mail.py --intents-tier2 [--retry-failed]
+                                       # run intent tier 2 (DeepSeek) on emails
+                                       # tier 1 was unsure about; no mail server
 
 This is a backend-side maintenance tool; the Streamlit frontend uses the API.
 """
@@ -41,6 +44,9 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as exc:
         print(f"Config error: {exc}", file=sys.stderr)
         return 2
+
+    if args.intents_tier2:
+        return _run_intents_tier2(settings, args.retry_failed)
 
     if args.redecide:
         # Re-deciding only re-applies the rule to stored predictions: no models needed.
@@ -119,6 +125,28 @@ def main(argv: list[str] | None = None) -> int:
     return 0 if result.ok else 1
 
 
+def _run_intents_tier2(settings, retry_failed: bool) -> int:
+    """Drain the intent tier-2 queue. Needs only the llama.cpp server, not Laya:
+    tier 1 already ran during the sync and stored its input."""
+    from mailbox_viewer.intent import LlamaServerTier2
+    from mailbox_viewer.intent_jobs import resolve_pending_intents
+
+    if not settings.tier2_enabled:
+        print("Intent tier 2 is disabled (TIER2_ENABLED=false)", file=sys.stderr)
+        return 2
+    tier2 = LlamaServerTier2(settings.tier2_url, settings.tier2_timeout_s, settings.tier2_max_tokens,
+                             settings.tier2_temperature)
+    print(f"Tier 2       : {tier2.name} at {settings.tier2_url} ({'up' if tier2.healthy() else 'NOT reachable'})")
+    engine = make_engine(settings.database_url, settings.db_schema)
+    init_db(engine, settings.db_schema)
+    counts = resolve_pending_intents(make_session_factory(engine), tier2, settings.tier2_max_per_job, retry_failed)
+    engine.dispose()
+    print(f"Processed    : {counts['processed']}  ({counts['tier2']} decided by tier 2, "
+          f"{counts['fallback']} fell back to tier 1 for review)")
+    print(f"Still waiting: {counts['remaining']}")
+    return 0
+
+
 def _counts(session_factory) -> dict[str, int]:
     with session_factory() as session:
         return {
@@ -143,6 +171,10 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--redecide", action="store_true", help="re-apply the decision rule to stored predictions; no models, no mail server")
     parser.add_argument("--attachments-only", action="store_true", help="with --reclassify: only emails that have attachments")
     parser.add_argument("--reclassify", action="store_true", help="re-run both models over the cache and exit; does not contact the server")
+    parser.add_argument("--intents-tier2", action="store_true",
+                        help="run intent tier 2 (DeepSeek) on up to TIER2_MAX_PER_JOB emails waiting for it, then exit")
+    parser.add_argument("--retry-failed", action="store_true",
+                        help="with --intents-tier2: also retry emails whose tier-2 call timed out or found no server")
     return parser.parse_args(argv)
 
 

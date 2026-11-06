@@ -21,6 +21,7 @@ STYLE = {
     "decision_log": ("#e8e6e1", "#1f1f1f"),
     "tickets": ("#d9534f", "#ffffff"),
     "ticket_events": ("#e8e6e1", "#1f1f1f"),
+    "email_intents": ("#5b8def", "#ffffff"),
 }
 
 OWNERSHIP = {
@@ -32,6 +33,8 @@ OWNERSHIP = {
     "decision_log": "The audit trail: every email judged, kept or not, with the decision and why.",
     "tickets": "One per payment thread: open, in progress or closed, when it opened and what closed it.",
     "ticket_events": "Every status change of a ticket, automatic or manual, with its time and reason.",
+    "email_intents": "One per payment email: what it is for (new invoice, reminder, confirmation, ...), which tier "
+                     "decided, and whether a human should review it. Only the 8 intent labels can be stored.",
 }
 
 

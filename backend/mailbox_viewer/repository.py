@@ -25,10 +25,22 @@ from .classifier import (
     Decision,
     EmailInput,
     body_decision_from_reason,
+    format_people,
     inherited_decision,
 )
+from .intent import TIER2_OK, TIER2_PENDING, TIER2_RETRYABLE, TIER2_UNPARSED, IntentDecision
 from .mail_parser import ParsedEmail
-from .models import Attachment, DecisionLog, Email, EmailParticipant, SyncState, Thread, to_naive_utc, utcnow_naive
+from .models import (
+    Attachment,
+    DecisionLog,
+    Email,
+    EmailIntent,
+    EmailParticipant,
+    SyncState,
+    Thread,
+    to_naive_utc,
+    utcnow_naive,
+)
 from .threads import ancestor_ids, conversation_key
 
 logger = logging.getLogger(__name__)
@@ -87,6 +99,30 @@ class EmailSummary:
 
 
 @dataclass(frozen=True)
+class IntentInfo:
+    intent: str
+    decided_by: str
+    needs_review: bool
+    tier1_intent: str
+    tier1_confidence: float
+    tier1_probabilities: dict[str, float]
+    tier2_intent: str | None
+    tier2_status: str | None
+    tier2_seconds: float | None
+    decided_at: datetime
+
+
+@dataclass(frozen=True)
+class PendingIntent:
+    """One email waiting for intent tier 2, with the state tier 1 saw."""
+
+    email_id: int
+    message_id: str
+    decision: IntentDecision
+    state: dict[str, str]
+
+
+@dataclass(frozen=True)
 class EmailDetail:
     id: int
     thread_id: int
@@ -104,6 +140,7 @@ class EmailDetail:
     decision_reason: str | None
     participants: tuple[ParticipantInfo, ...]
     attachments: tuple[AttachmentInfo, ...]
+    intent: IntentInfo | None = None
 
     def by_role(self, role: str) -> list[ParticipantInfo]:
         return [p for p in self.participants if p.role == role]
@@ -169,9 +206,17 @@ def log_decision(session: Session, message_id: str, decision: Decision) -> None:
     session.flush()
 
 
-def insert_email(session: Session, mail: ParsedEmail, decision: Decision, blob_keys: Sequence[str]) -> int:
+def insert_email(
+    session: Session,
+    mail: ParsedEmail,
+    decision: Decision,
+    blob_keys: Sequence[str],
+    intent: IntentDecision | None = None,
+    intent_input: dict[str, str] | None = None,
+) -> int:
     """Insert one parsed mail: thread (found or created), participants,
-    attachments (metadata + blob key), decision log, thread roll-ups.
+    attachments (metadata + blob key), decision log, thread roll-ups, and its
+    intent when it has one (``intent_input`` is kept only while tier 2 is pending).
 
     ``blob_keys`` is one key per attachment, already written to the store.
     The caller owns the transaction; a UNIQUE violation on ``message_id``
@@ -211,6 +256,8 @@ def insert_email(session: Session, mail: ParsedEmail, decision: Decision, blob_k
                 confidence=verdict.confidence,
             )
         )
+    if intent is not None:
+        row.intent = _intent_row(EmailIntent(), intent, intent_input)
     session.add(row)
 
     thread.message_count += 1
@@ -277,16 +324,38 @@ def reclassify_all(
             AttachmentInput(a.filename, a.content_type, store.get(a.blob_key) if store.exists(a.blob_key) else None)
             for a in row.attachments
         )
-        return EmailInput(row.subject, row.body_text, inputs)
+        return EmailInput(
+            row.subject, row.body_text, inputs,
+            sender=format_people([(p.name, p.address) for p in row.participants if p.role == "from"]),
+            recipients=format_people([(p.name, p.address) for p in row.participants if p.role == "to"]),
+        )
+
+    # With an intent step, the full flow runs and the intent is kept for after().
+    results: dict[int, object] = {}
 
     def run(row: Email) -> Decision:
-        return classifier.classify(email_of(row))
+        if not classifier.has_intent:
+            return classifier.classify(email_of(row))
+        results[row.id] = outcome = classifier.run(email_of(row))
+        return outcome.decision
 
     def inherit(row: Email) -> Decision:
-        return classifier.inherit(email_of(row))
+        if not classifier.has_intent:
+            return classifier.inherit(email_of(row))
+        results[row.id] = outcome = classifier.run(email_of(row), inherited=True)
+        return outcome.decision
+
+    def after(row: Email, decision: Decision) -> None:
+        if not classifier.has_intent:
+            return  # intent off: leave stored intents as they are
+        outcome = results.pop(row.id, None)
+        if decision.is_payment and outcome is not None and outcome.intent is not None:
+            set_intent(session, row, outcome.intent, outcome.intent_input)
+        elif not decision.is_payment:
+            set_intent(session, row, None)
 
     where = Email.has_attachments.is_(True) if only_with_attachments else None  # e.g. after installing OCR
-    return _replay(session, run, where, progress_label="reclassify", inherit=inherit)
+    return _replay(session, run, where, progress_label="reclassify", inherit=inherit, after=after)
 
 
 def redecide_all(session: Session, classifier: EmailClassifier) -> int:
@@ -308,12 +377,22 @@ def redecide_all(session: Session, classifier: EmailClassifier) -> int:
     def inherit(row: Email) -> Decision:  # stored attachment labels; no model is run
         return inherited_decision(tuple(AttachmentDecision(a.doc_type, a.confidence, a.filename) for a in row.attachments))
 
-    return _replay(session, run, None, progress_label=None, run_gets_log=True, inherit=inherit)
+    def after(row: Email, decision: Decision) -> None:
+        # No models run here, so an intent cannot be computed; but an email that
+        # is no longer payment must not keep one.
+        if not decision.is_payment:
+            set_intent(session, row, None)
+
+    return _replay(session, run, None, progress_label=None, run_gets_log=True, inherit=inherit, after=after)
 
 
-def _replay(session: Session, run, where, progress_label: str | None, run_gets_log: bool = False, inherit=None) -> int:
-    """Decide emails oldest first so the thread rule sees earlier emails first."""
-    stmt = select(Email).options(selectinload(Email.attachments))
+def _replay(session: Session, run, where, progress_label: str | None, run_gets_log: bool = False, inherit=None,
+            after=None) -> int:
+    """Decide emails oldest first so the thread rule sees earlier emails first.
+    ``after(row, decision)`` runs for every email once its decision is set."""
+    stmt = select(Email).options(
+        selectinload(Email.attachments), selectinload(Email.participants), selectinload(Email.intent)
+    )
     if where is not None:
         stmt = stmt.where(where)
     rows = sorted(session.scalars(stmt).all(), key=_order_key)
@@ -356,6 +435,8 @@ def _replay(session: Session, run, where, progress_label: str | None, run_gets_l
                 att.doc_type = verdict.doc_type
                 att.confidence = verdict.confidence
         _log_decision(session, row.message_id, decision, existing=log)
+        if after is not None:
+            after(row, decision)
         if before != (row.doc_type, row.confidence, row.decision_reason, row.matched_directly):
             changed += 1
     session.flush()
@@ -376,6 +457,128 @@ def _note_for(reason: str, filename: str) -> str | None:
     if marker not in reason:
         return None
     return reason.split(marker, 1)[1].split(";")[0].split(" ->")[0].strip()
+
+
+# -- intents -----------------------------------------------------------------------
+
+
+def _intent_row(row: EmailIntent, decision: IntentDecision, tier2_input: dict[str, str] | None) -> EmailIntent:
+    row.intent = decision.intent
+    row.decided_by = decision.decided_by
+    row.needs_review = decision.needs_review
+    row.tier1_intent = decision.tier1_intent
+    row.tier1_confidence = decision.tier1_confidence
+    row.tier1_probabilities = dict(decision.tier1_probabilities)
+    row.tier2_intent = decision.tier2_intent
+    row.tier2_status = decision.tier2_status
+    row.tier2_seconds = decision.tier2_seconds
+    # The email text is kept only while tier 2 may still need it.
+    keep = decision.tier2_status == TIER2_PENDING or decision.tier2_status in TIER2_RETRYABLE
+    row.tier2_input = dict(tier2_input) if keep and tier2_input else None
+    row.decided_at = utcnow_naive()
+    return row
+
+
+def set_intent(session: Session, email: Email, decision: IntentDecision | None,
+               tier2_input: dict[str, str] | None = None) -> None:
+    """Store, replace or (with ``decision=None``) remove an email's intent."""
+    if decision is None:
+        if email.intent is not None:
+            session.delete(email.intent)
+            email.intent = None
+        return
+    email.intent = _intent_row(email.intent or EmailIntent(), decision, tier2_input)
+
+
+def _intent_decision(row: EmailIntent) -> IntentDecision:
+    return IntentDecision(
+        intent=row.intent, decided_by=row.decided_by, needs_review=row.needs_review,
+        tier1_intent=row.tier1_intent, tier1_confidence=row.tier1_confidence,
+        tier1_probabilities=dict(row.tier1_probabilities or {}),
+        tier2_intent=row.tier2_intent, tier2_status=row.tier2_status, tier2_seconds=row.tier2_seconds,
+    )
+
+
+def _intent_info(row: EmailIntent | None) -> IntentInfo | None:
+    if row is None:
+        return None
+    return IntentInfo(row.intent, row.decided_by, row.needs_review, row.tier1_intent, row.tier1_confidence,
+                      dict(row.tier1_probabilities or {}), row.tier2_intent, row.tier2_status, row.tier2_seconds,
+                      row.decided_at)
+
+
+def _waiting_for_tier2(retry_failed: bool):
+    statuses = (TIER2_PENDING, *TIER2_RETRYABLE) if retry_failed else (TIER2_PENDING,)
+    return EmailIntent.tier2_status.in_(statuses) & EmailIntent.tier2_input.is_not(None)
+
+
+def pending_intents(session: Session, limit: int, retry_failed: bool = False) -> list[PendingIntent]:
+    """Emails waiting for intent tier 2, oldest decision first. With
+    ``retry_failed``, also those whose tier-2 call timed out or found no server."""
+    rows = session.execute(
+        select(EmailIntent, Email.message_id)
+        .join(Email, Email.id == EmailIntent.email_id)
+        .where(_waiting_for_tier2(retry_failed))
+        .order_by(EmailIntent.decided_at, EmailIntent.id)
+        .limit(limit)
+    ).all()
+    return [PendingIntent(r.email_id, mid, _intent_decision(r), dict(r.tier2_input)) for r, mid in rows]
+
+
+def count_pending_intents(session: Session, retry_failed: bool = False) -> int:
+    return session.scalar(select(func.count()).select_from(EmailIntent).where(_waiting_for_tier2(retry_failed))) or 0
+
+
+def complete_intent(session: Session, email_id: int, decision: IntentDecision, tier2_input: dict[str, str]) -> bool:
+    """Store tier 2's outcome. False when the email or its intent is gone, or
+    another worker already finished it (it is no longer waiting)."""
+    row = session.scalar(select(EmailIntent).where(EmailIntent.email_id == email_id))
+    if row is None or row.tier2_status not in (TIER2_PENDING, *TIER2_RETRYABLE):
+        return False
+    _intent_row(row, decision, tier2_input)
+    session.flush()
+    return True
+
+
+def intent_summary(session: Session) -> dict:
+    """Counts for monitoring: who decided, tier-2 outcomes and latency, review
+    rate, and the intent distribution."""
+    rows = session.execute(
+        select(EmailIntent.intent, EmailIntent.decided_by, EmailIntent.tier2_status, EmailIntent.needs_review,
+               EmailIntent.tier2_seconds)
+    ).all()
+    by_intent: dict[str, int] = {}
+    by_decided_by: dict[str, int] = {}
+    by_tier2_status: dict[str, int] = {}
+    seconds: list[float] = []
+    for intent, decided_by, status, _review, secs in rows:
+        by_intent[intent] = by_intent.get(intent, 0) + 1
+        by_decided_by[decided_by] = by_decided_by.get(decided_by, 0) + 1
+        if status:
+            by_tier2_status[status] = by_tier2_status.get(status, 0) + 1
+        if secs is not None and status in (TIER2_OK, TIER2_UNPARSED):
+            seconds.append(secs)
+    called = sum(n for s, n in by_tier2_status.items() if s != TIER2_PENDING)
+    failed = called - by_tier2_status.get(TIER2_OK, 0)
+    seconds.sort()
+    return {
+        "total": len(rows),
+        "needs_review": sum(1 for r in rows if r[3]),
+        "pending": by_tier2_status.get(TIER2_PENDING, 0),
+        "by_intent": by_intent,
+        "by_decided_by": by_decided_by,
+        "by_tier2_status": by_tier2_status,
+        "tier2_failure_rate": round(failed / called, 4) if called else None,
+        "tier2_seconds_p50": _percentile(seconds, 0.5),
+        "tier2_seconds_p90": _percentile(seconds, 0.9),
+        "tier2_seconds_max": seconds[-1] if seconds else None,
+    }
+
+
+def _percentile(sorted_values: list[float], q: float) -> float | None:
+    if not sorted_values:
+        return None
+    return sorted_values[min(len(sorted_values) - 1, int(q * len(sorted_values)))]
 
 
 def _recompute_thread_flags(session: Session) -> None:
@@ -499,19 +702,21 @@ def _email_summary(row: Email) -> EmailSummary:
 
 
 def get_email_detail(session: Session, email_id: int) -> EmailDetail | None:
-    row = session.get(Email, email_id, options=[selectinload(Email.participants), selectinload(Email.attachments)])
+    row = session.get(Email, email_id, options=[selectinload(Email.participants), selectinload(Email.attachments),
+                                                selectinload(Email.intent)])
     return _email_detail(row) if row is not None else None
 
 
 def get_thread_messages(session: Session, thread_id: int) -> list[tuple[EmailDetail, DecisionInfo | None]]:
     """Every message of a thread, newest first, with its decision line.
 
-    Four queries in all (emails, participants, attachments, decisions) however
-    long the thread is: on a remote database each query is a network round trip.
+    Five queries in all (emails, participants, attachments, intents, decisions)
+    however long the thread is: on a remote database each query is a network
+    round trip.
     """
     rows = session.scalars(
         select(Email)
-        .options(selectinload(Email.participants), selectinload(Email.attachments))
+        .options(selectinload(Email.participants), selectinload(Email.attachments), selectinload(Email.intent))
         .where(Email.thread_id == thread_id)
         .order_by(Email.received_at.desc().nulls_last(), Email.id.desc())
     ).all()
@@ -539,6 +744,7 @@ def _email_detail(row: Email) -> EmailDetail:
         decision_reason=row.decision_reason,
         participants=tuple(ParticipantInfo(p.role, p.name, p.address) for p in row.participants),
         attachments=tuple(_attachment_info(a) for a in row.attachments),
+        intent=_intent_info(row.intent),
     )
 
 

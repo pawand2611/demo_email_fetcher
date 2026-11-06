@@ -64,6 +64,8 @@ job; you then poll `GET /jobs/{id}` until `state` is no longer `running`.
 | POST | [`/reclassify`](#post-reclassify) | Re-run the models on stored mail (job) | **🧠 Re-run models** |
 | POST | [`/redecide`](#post-redecide) | Re-apply the decision rules to stored scores (job) | **⚖️ Re-apply rules** |
 | POST | [`/tickets/rebuild`](#post-ticketsrebuild) | Recreate every ticket from stored mail (job) | **🎫 Rebuild tickets** |
+| POST | [`/intents/tier2`](#post-intentstier2) | Run intent tier 2 (DeepSeek) on emails waiting for it (job) | **🤖 Resolve unsure intents** |
+| GET | [`/intents/summary`](#get-intentssummary) | Intent counts, tier-2 outcomes and latency | Overview |
 | GET | [`/jobs/{job_id}`](#get-jobsjob_id) | State and result of a job | every job button (polling) |
 | GET | [`/sync/latest`](#get-synclatest) | The most recent sync job | — |
 | GET | [`/threads`](#get-threads) | Conversation list | Overview, Inbox |
@@ -208,6 +210,38 @@ replies in active tickets. **Manual closes and reopens are not kept.**
 
 **Response** `202` with a Job. **Result**: `{"changed": n, "opened": n, "in_progress": n, "closed": n, "reopened": n}`.
 **Errors**: `409` if another kind of job is running.
+
+### POST /intents/tier2
+
+Run intent tier 2, DeepSeek on the local llama.cpp server, on the payment emails
+whose intent Laya was unsure about. Each call handles up to `TIER2_MAX_PER_JOB`
+emails, oldest first, at about 100 s each on CPU. Each answer is saved as soon
+as it arrives.
+
+**Query**: `retry_failed` (bool, default false): also retry emails whose
+earlier tier-2 call timed out or found no server.
+**Response** `202` with a Job of kind `intents`. **Result**:
+`{"processed": n, "tier2": n, "fallback": n, "skipped": n, "remaining": n}`.
+`tier2` counts emails decided by DeepSeek, `fallback` counts those that kept
+Laya's answer for review, and `remaining` counts those still waiting.
+**Errors**: `503` if intent classification or tier 2 is not enabled; `409` if
+another kind of job is running.
+
+### GET /intents/summary
+
+Monitoring numbers over `email_intents`. Fields:
+- `total`, `needs_review`, `pending`
+- `by_intent`, `by_decided_by`, `by_tier2_status`
+- `tier2_failure_rate`: unparsed, timeout or unavailable, out of all tier-2 calls
+- `tier2_seconds_p50`, `tier2_seconds_p90`, `tier2_seconds_max`: over answered calls
+
+Every message in `GET /threads/{thread_id}` also carries its `intent`, or
+`null` when it is not a payment email. The fields are `intent`, `decided_by`,
+`needs_review`, `tier1_intent`, `tier1_confidence`, `tier1_probabilities`,
+`tier2_intent`, `tier2_status`, `tier2_seconds` and `decided_at`. A sync job's
+result adds `intents` and `intents_pending`. `GET /profiles` adds
+`intent_model`, `intent_labels`, `tier1_min_confidence` and `tier2`, which is
+`off`, `background` or `inline`.
 
 ### GET /jobs/{job_id}
 

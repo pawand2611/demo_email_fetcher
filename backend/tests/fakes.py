@@ -67,11 +67,64 @@ class FakeBodyModel:
         return Prediction("other", 0.80)
 
 
-def fake_classifier(body=None, document=None, min_confidence: float = 0.5, body_min_confidence: float = 0.7):
+class FakeIntentTier1:
+    """Stands in for Laya's intent question. ``new_invoice`` at 0.90 unless
+    ``overrides`` maps a subject to (intent, confidence). Records each state."""
+
+    name = "fake-intent-tier1"
+
+    def __init__(self) -> None:
+        self.overrides: dict[str, tuple[str, float]] = {}
+        self.fail_on: set[str] = set()
+        self.states: list[dict] = []
+
+    def classify(self, state):
+        from mailbox_viewer.intent import INTENT_KEYS, checked_tier1
+
+        self.states.append(dict(state))
+        if state["subject"] in self.fail_on:
+            raise RuntimeError("laya failed")
+        intent, confidence = self.overrides.get(state["subject"], ("new_invoice", 0.90))
+        probs = {k: (0.65 if k == intent else 0.05) for k in INTENT_KEYS}
+        return checked_tier1(intent, probs, confidence)
+
+
+class FakeIntentTier2:
+    """Stands in for DeepSeek: answers ``result`` (default: partial_payment, ok, 104 s)."""
+
+    name = "fake-intent-tier2"
+
+    def __init__(self, result=None) -> None:
+        from mailbox_viewer.intent import TIER2_OK, Tier2Result
+
+        self.result = result or Tier2Result("partial_payment", TIER2_OK, 104.0)
+        self.up = True
+        self.states: list[dict] = []
+
+    def healthy(self) -> bool:
+        return self.up
+
+    def classify(self, state):
+        self.states.append(dict(state))
+        return self.result
+
+
+def fake_intent_stage(tier1=None, tier2=None, *, tier2_enabled: bool = True, inline: bool = False,
+                      min_confidence: float = 0.4):
+    from mailbox_viewer.intent import IntentStage
+
+    return IntentStage(tier1 or FakeIntentTier1(), tier2 if tier2 is not None else FakeIntentTier2(),
+                       min_confidence=min_confidence, tier2_enabled=tier2_enabled, tier2_inline=inline,
+                       clean=lambda text: text.strip(), max_chars=3000)
+
+
+def fake_classifier(body=None, document=None, min_confidence: float = 0.5, body_min_confidence: float = 0.7,
+                    intent=None):
     """An EmailClassifier (the real LangGraph flow) over the fake models."""
     from mailbox_viewer.classification_graph import EmailClassifier
 
-    return EmailClassifier(body or FakeBodyModel(), document or FakeDocumentModel(), min_confidence, body_min_confidence)
+    return EmailClassifier(body or FakeBodyModel(), document or FakeDocumentModel(), min_confidence,
+                           body_min_confidence, intent=intent)
 
 
 def build_message(
