@@ -106,10 +106,26 @@ class EmailInput:
     subject: str
     body: str
     attachments: tuple[AttachmentInput, ...] = ()
+    # Read only by the intent step (intent.py); the payment models ignore them.
+    sender: str = ""  # "Name <address>"
+    recipients: str = ""  # comma-separated To addresses
+    body_html: str = field(default="", repr=False)  # used when there is no plain-text body
 
     @classmethod
     def from_parsed(cls, mail: ParsedEmail) -> "EmailInput":
-        return cls(mail.subject, mail.body_text, AttachmentInput.all_from_parsed(mail))
+        return cls(
+            mail.subject,
+            mail.body_text,
+            AttachmentInput.all_from_parsed(mail),
+            sender=format_people([(p.name, p.address) for p in mail.participants if p.role == "from"]),
+            recipients=format_people([(p.name, p.address) for p in mail.participants if p.role == "to"]),
+            body_html=mail.body_html,
+        )
+
+
+def format_people(people: Sequence[tuple[str, str]]) -> str:
+    """``Name <address>, other@x`` as in a mail header."""
+    return ", ".join(f"{name} <{address}>" if name else address for name, address in people)
 
 
 @dataclass(frozen=True)

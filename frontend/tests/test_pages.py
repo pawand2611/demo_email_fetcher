@@ -51,6 +51,10 @@ TICKETS = {
 ACTIONS: list[tuple] = []  # manual ticket actions the pages sent
 
 
+INTENT_PROBS = {"new_invoice": 0.1, "payment_reminder": 0.3, "payment_confirmation": 0.1, "credit_note": 0.1,
+                "dispute_query": 0.1, "partial_payment": 0.2, "cancellation": 0.05, "other": 0.05}
+
+
 class FakeApi:
     """Answers like the backend for every call the pages make."""
 
@@ -65,7 +69,20 @@ class FakeApi:
                  "model": "layoutlmv3+laya", "model_min_confidence": 0.5, "body_min_confidence": 0.7,
                  "attachment_decides_confidence": 0.8, "ticket_close_confidence": 0.8,
                  "payment_labels": ["invoice", "receipt", "statement"],
-                 "attachment_store": "local folder data/attachments"}]
+                 "attachment_store": "local folder data/attachments",
+                 "intent_model": "laya-intent -> deepseek-r1-distill (llama.cpp) (background job)",
+                 "intent_labels": list(INTENT_PROBS), "tier1_min_confidence": 0.4, "tier2": "background"}]
+
+    def intent_summary(self):
+        return {"total": 2, "needs_review": 1, "pending": 1,
+                "by_intent": {"new_invoice": 1, "payment_reminder": 1},
+                "by_decided_by": {"tier1": 2}, "by_tier2_status": {"pending": 1}, "tier2_failure_rate": None,
+                "tier2_seconds_p50": None, "tier2_seconds_p90": None, "tier2_seconds_max": None}
+
+    def resolve_intents(self, *, retry_failed=False):
+        ACTIONS.append(("resolve_intents", retry_failed))
+        return {"id": "j1", "kind": "intents", "state": "succeeded", "started_at": NOW, "finished_at": NOW,
+                "result": {"processed": 1, "tier2": 1, "fallback": 0, "skipped": 0, "remaining": 0}, "error": None}
 
     def stats(self):
         return {"threads": 1, "emails": 2, "attachments": 1, "payment_threads": 1, "needs_review": 0,
@@ -101,8 +118,9 @@ class FakeApi:
                  "last_message_at": NOW, "has_payment": True, "participants": "Acme <a@x>", "attachment_count": 1}]
 
     def thread(self, thread_id):
-        def message(mid, subject, decision, tier, reason, attachments):
+        def message(mid, subject, decision, tier, reason, attachments, intent=None):
             return {"id": 1, "message_id": mid, "subject": subject, "body_text": "PFA", "received_at": NOW,
+                    "intent": intent,
                     "in_reply_to": None, "references_header": None, "has_attachments": bool(attachments),
                     "matched_directly": tier != 0, "doc_type": "invoice", "confidence": 1.0 if tier else None,
                     "decision_reason": reason,
@@ -113,8 +131,11 @@ class FakeApi:
                                  "reason": reason, "decided_at": NOW}}
         invoice = {"id": 7, "filename": "inv.jpg", "content_type": "image/jpeg", "size_bytes": 2048,
                    "blob_key": "ab" * 32, "doc_type": "invoice", "confidence": 1.0, "download_url": "/attachments/7"}
+        pending = {"intent": "payment_reminder", "decided_by": "tier1", "needs_review": True,
+                   "tier1_intent": "payment_reminder", "tier1_confidence": 0.19, "tier1_probabilities": INTENT_PROBS,
+                   "tier2_intent": None, "tier2_status": "pending", "tier2_seconds": None, "decided_at": NOW}
         return {**self.threads()[0], "messages": [
-            message("<b@x>", "Re: Invoice", "payment", 0, INHERITED, []),
+            message("<b@x>", "Re: Invoice", "payment", 0, INHERITED, [], intent=pending),
             message("<a@x>", "Invoice", "payment", 1, '"inv.jpg": invoice (1.00)', [invoice]),
         ]}
 
@@ -177,6 +198,29 @@ class PagesRender(unittest.TestCase):
         decisions = [c.value for c in at.code]
         self.assertTrue(any("Check 1 · thread" in d for d in decisions))
         self.assertTrue(any("Check 2 · attachment" in d for d in decisions))
+
+    def test_overview_shows_what_payment_emails_are_for(self) -> None:
+        at = self.run_page()
+        self.assertIn("What payment emails are for", [s.value for s in at.subheader])
+        metrics = {m.label: m.value for m in at.metric}
+        self.assertEqual((metrics["Waiting for DeepSeek"], metrics["Needs review"]), ("1", "1"))
+
+    def test_message_shows_its_intent(self) -> None:
+        at = self.run_page()
+        at.button(key="open-1").click().run()
+        self.assertFalse(at.exception, [e.value for e in at.exception])
+        self.assertTrue(any("waiting for DeepSeek" in c.value and "needs review" in c.value for c in at.caption))
+        intent = next(c.value for c in at.code if c.value.startswith("intent"))
+        self.assertIn("tier 1 (Laya): payment_reminder · confidence 0.19", intent)
+        self.assertIn("status pending", intent)
+
+    def test_resolving_unsure_intents_from_the_sidebar(self) -> None:
+        ACTIONS.clear()
+        at = self.run_page()
+        next(b for b in at.button if b.label == "🤖 Resolve unsure intents").click().run()
+        self.assertFalse(at.exception, [e.value for e in at.exception])
+        self.assertEqual(ACTIONS, [("resolve_intents", False)])
+        self.assertTrue(any("1 decided by DeepSeek" in s.value for s in at.success))
 
     def test_decision_log_shows_kept_and_not_kept(self) -> None:
         at = self.run_page("views/decisions.py")

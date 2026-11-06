@@ -6,8 +6,8 @@ import pandas as pd
 import streamlit as st
 
 from api_client import ApiError, parse_time
-from ui import (CHECK_BADGES, CHECKS, DECISION_COLORS, DOC_COLORS, PAYMENT_TYPES, TICKET_STATUS, TIERS, escape_md,
-                fmt, get_api, human_size, person, which_check)
+from ui import (CHECK_BADGES, CHECKS, DECISION_COLORS, DOC_COLORS, INTENT_COLORS, INTENT_DECIDED_BY, INTENT_LABELS,
+                PAYMENT_TYPES, TICKET_STATUS, TIERS, escape_md, fmt, get_api, human_size, person, which_check)
 
 api = get_api()
 st.title("📬 Inbox")
@@ -116,11 +116,20 @@ def render_message(m: dict, expanded: bool) -> None:
         conf = f"confidence {m['confidence']:.2f} · " if m["confidence"] is not None else ""
         badges[3].caption(f"{CHECKS[check]} · {conf}{m['decision_reason'] or ''}")
 
+        intent = m.get("intent")
+        if intent:
+            render_intent_line(intent)
+
         for role, label in (("from", "From"), ("to", "To"), ("cc", "Cc"), ("bcc", "Bcc")):
             if people[role]:
                 st.text(f"{label}: " + ", ".join(person(p) for p in people[role]))
 
-        tab_text, tab_files, tab_decision = st.tabs(["Text", f"Attachments ({len(m['attachments'])})", "Decision"])
+        tab_names = ["Text", f"Attachments ({len(m['attachments'])})", "Decision"] + (["Intent"] if intent else [])
+        tabs = st.tabs(tab_names)
+        tab_text, tab_files, tab_decision = tabs[:3]
+        if intent:
+            with tabs[3]:
+                render_intent_detail(intent)
         with tab_text:
             if m["body_text"].strip():
                 st.text(m["body_text"])
@@ -155,6 +164,36 @@ def render_message(m: dict, expanded: bool) -> None:
                     f"in_reply_to: {m['in_reply_to'] or '-'}",
                     language=None,
                 )
+
+
+def render_intent_line(intent: dict) -> None:
+    """One line under the decision badges: the intent and how it was reached."""
+    cols = st.columns([1, 6])
+    cols[0].badge(INTENT_LABELS.get(intent["intent"], intent["intent"]), color=INTENT_COLORS.get(intent["intent"], "gray"))
+    if intent["tier2_status"] == "pending":
+        note = f"Laya unsure ({intent['tier1_confidence']:.2f}); waiting for DeepSeek"
+    else:
+        note = f"{INTENT_DECIDED_BY.get(intent['decided_by'], intent['decided_by'])} · Laya confidence {intent['tier1_confidence']:.2f}"
+    cols[1].caption(f"Intent · {note}" + (" · ⚠️ needs review" if intent["needs_review"] else ""))
+
+
+def render_intent_detail(intent: dict) -> None:
+    probs = sorted(intent["tier1_probabilities"].items(), key=lambda kv: -kv[1])
+    st.code(
+        f"intent       : {intent['intent']}\n"
+        f"decided by   : {INTENT_DECIDED_BY.get(intent['decided_by'], intent['decided_by'])}\n"
+        f"needs review : {'yes' if intent['needs_review'] else 'no'}\n"
+        f"tier 1 (Laya): {intent['tier1_intent']} · confidence {intent['tier1_confidence']:.2f}\n"
+        f"tier 2       : {intent['tier2_intent'] or '-'} · status {intent['tier2_status'] or 'not called'}"
+        + (f" · {intent['tier2_seconds']:.0f}s" if intent["tier2_seconds"] is not None else "") + "\n"
+        f"decided_at   : {fmt(intent['decided_at'])}",
+        language=None,
+    )
+    st.dataframe(
+        pd.DataFrame({"intent": [INTENT_LABELS.get(k, k) for k, _ in probs], "Laya probability": [v for _, v in probs]}),
+        hide_index=True, width="stretch",
+        column_config={"Laya probability": st.column_config.ProgressColumn(min_value=0.0, max_value=1.0, format="%.2f")},
+    )
 
 
 for index, message in enumerate(thread["messages"]):
